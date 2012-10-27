@@ -15,53 +15,39 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 #include <time.h>
 #include <sys/time.h>
 #include <sys/socket.h>
-#include <netinet/ip.h>
-#include <net/if.h>
-#include <ctype.h>
 #include <linux/dccp.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/in.h>
 #include <netdb.h>
-#include <ifaddrs.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <errno.h>
+#include "checksums.h"
 
 extern int errno;
 
-
-//Pseudo Header for checksums
-#define IP4_ADDR_LEN 	4
-struct ip4_pseudo_hdr{
-	unsigned char src[IP4_ADDR_LEN];
-	unsigned char dest[IP4_ADDR_LEN];
-	unsigned int len;
-	unsigned char zero[3];
-	unsigned char nxt;
-};
-#define IP6_ADDR_LEN 	16
-struct ip6_pseudo_hdr{
-	unsigned char src[IP6_ADDR_LEN];
-	unsigned char dest[IP6_ADDR_LEN];
-	unsigned int len;
-	unsigned char zero[3];
-	unsigned char nxt;
-};
+typedef union ipaddr{
+	struct sockaddr *gen;
+	struct sockaddr_in *ipv4;
+	struct sockaddr_in6 *ipv6;
+} ipaddr_ptr_t;
 
 
-int debug=0;		/*set to 1 to turn on debugging information*/
-int count=-1;
-int dest_port=33434;
-int ttl=64;
-long interval=1000;
-int ip_type=AF_UNSPEC;
-socklen_t addrlen;
-struct sockaddr *dest_addr;
-struct sockaddr *src_addr;
+int debug=0;			/*set to 1 to turn on debugging information*/
+int count=-1;			/*Default number of pings (-1 is infinity)*/
+int dest_port=33434;	/*Default port*/
+int ttl=64;				/*Default TTL*/
+long interval=1000;		/*Default delay between pings in ms*/
+int ip_type=AF_UNSPEC;	/*IPv4 or IPv6*/
+ipaddr_ptr_t dest_addr;
+ipaddr_ptr_t src_addr;
 
 
+void getAddresses(char *src, char* dst);
 void doping();
-int ip6_chksum(unsigned char* buff, int len, unsigned char* dest, unsigned char* src, int type, unsigned short* chksum);
-int ip4_chksum(unsigned char* buff, int len, unsigned char* dest, unsigned char* src, int type, unsigned short* chksum);
-u_int32_t checksum(unsigned char *buf, unsigned nbytes, u_int32_t sum);
-u_int32_t wrapsum(u_int32_t sum);
+void buildPacket(unsigned char* buffer, int *len);
 void dbgprintf(int level, const char *fmt, ...);
 void sanitize_environment();
 void usage();
@@ -73,14 +59,7 @@ int main(int argc, char *argv[])
 	char c;
 	char *src=NULL;
 	char *dst=NULL;
-	int err;
-	struct addrinfo hint;
-	struct addrinfo *dtmp, *stmp;
-	struct ifaddrs *temp, *cur;
-	struct sockaddr_in6* iv6;
-	struct sockaddr_in6 lv6;
-	struct sockaddr_in lv4;
-	struct sockaddr_in* iv4;
+
 
 	sanitize_environment();
 
@@ -136,6 +115,23 @@ int main(int argc, char *argv[])
 	}
 	dst=argv[0];
 
+	getAddresses(src, dst);
+
+	doping();
+
+	free(src_addr.gen);
+	free(dest_addr.gen);
+	return 0;
+}
+
+void getAddresses(char *src, char* dst){
+	struct addrinfo hint;
+	struct addrinfo *dtmp, *stmp;
+	struct ifaddrs *temp, *cur;
+	struct sockaddr_in6* iv6;
+	int addrlen;
+	int err;
+
 	/*Lookup destination Address*/
 	memset(&hint,0,sizeof(struct addrinfo));
 	hint.ai_family=ip_type;
@@ -149,14 +145,14 @@ int main(int argc, char *argv[])
 		dbgprintf(0,"Error: Unknown Host %s\n", dst);
 		exit(1);
 	}else{
-		hint.ai_family=ip_type=dtmp->ai_family;
 		addrlen=dtmp->ai_addrlen;
-		dest_addr=malloc(dtmp->ai_addrlen);
-		if(dest_addr==NULL){
+		hint.ai_family=ip_type=dtmp->ai_family;
+		dest_addr.gen=malloc(dtmp->ai_addrlen);
+		if(dest_addr.gen==NULL){
 			dbgprintf(0,"Error: Can't allocate Memory\n");
 			exit(1);
 		}
-		memcpy(dest_addr,dtmp->ai_addr,dtmp->ai_addrlen);
+		memcpy(dest_addr.gen,dtmp->ai_addr,dtmp->ai_addrlen);
 	}
 	freeaddrinfo(dtmp);
 
@@ -171,143 +167,113 @@ int main(int argc, char *argv[])
 			dbgprintf(0,"Error: Unknown Host %s\n", dst);
 			exit(1);
 		}else{
-			src_addr=malloc(stmp->ai_addrlen);
-			if(src_addr==NULL){
+			addrlen=stmp->ai_addrlen;
+			src_addr.gen=malloc(stmp->ai_addrlen);
+			if(src_addr.gen==NULL){
 				dbgprintf(0,"Error: Can't allocate Memory\n");
 				exit(1);
 			}
-			memcpy(src_addr,stmp->ai_addr,stmp->ai_addrlen);
+			memcpy(src_addr.gen,stmp->ai_addr,stmp->ai_addrlen);
 		}
 		freeaddrinfo(stmp);
 	}else{
 		/*Guess a good source address*/
-		inet_pton(AF_INET6,"::1",&lv6);
-		inet_pton(AF_INET,"127.0.0.1",&lv4);
 		getifaddrs(&temp);
 		cur=temp;
 		while(cur!=NULL){
-			if((cur->ifa_flags & IFF_BROADCAST) == IFF_BROADCAST){ /*Not broad cast*/
+			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=ip_type){ /*Not matching ipv4/ipv6 of dest*/
 				cur=cur->ifa_next;
 				continue;
 			}
-			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=ip_type){ /*Not matching ipv4/ipv6 of dest*/
+			if(cur->ifa_flags & IFF_LOOPBACK){ /*Don't use loopback addresses*/
 				cur=cur->ifa_next;
 				continue;
 			}
 			if(cur->ifa_addr!=NULL && cur->ifa_addr->sa_family==AF_INET6){
 				iv6=(struct sockaddr_in6*)cur->ifa_addr;
+
 				if(iv6->sin6_scope_id!=0){ /*Not globally valid address, if ipv6*/
 					cur=cur->ifa_next;
 					continue;
 				}
-				if(memcmp(&lv6.sin6_addr,&iv6->sin6_addr,sizeof(iv6->sin6_addr))==0){/*IPv6 loopback*/
-					cur=cur->ifa_next;
-					continue;
-				}
-			}
-			if(cur->ifa_addr!=NULL && cur->ifa_addr->sa_family==AF_INET){
-				iv4=(struct sockaddr_in*)cur->ifa_addr;
-				if(memcmp(&lv4.sin_addr,&iv4->sin_addr,sizeof(iv4->sin_addr))==0){/*IPv4 loopback*/
-					cur=cur->ifa_next;
-					continue;
-				}
 			}
 
-			src_addr=malloc(sizeof(struct sockaddr_storage));
-			if(src_addr==NULL){
+			src_addr.gen=malloc(sizeof(struct sockaddr_storage));
+			if(src_addr.gen==NULL){
 				dbgprintf(0,"Error: Can't allocate Memory\n");
 				exit(1);
 			}
-			src_addr->sa_family=ip_type;
-			memcpy(src_addr,cur->ifa_addr,addrlen);
-			break;
+			src_addr.gen->sa_family=ip_type;
+			memcpy(src_addr.gen,cur->ifa_addr,addrlen);
+			//break;
+			cur=cur->ifa_next;
 		}
 		freeifaddrs(temp);
 	}
-
-	doping();
-
-
-	free(src_addr);
-	free(dest_addr);
-	return 0;
+	return;
 }
 
 /*Preform the ping functionality*/
 void doping(){
-	int ds, is;
+	int rs, is,ds;
 	int done=0;
-	int seq=8;
-	int slen=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_request);
-	unsigned char sbuffer[slen+1];
+	int addrlen;
+	int slen=1500;
+	unsigned char sbuffer[slen];
 	unsigned char rbuffer[1000];
 	char pbuf[1000];
 	struct dccp_hdr *dhdr;
-	struct dccp_hdr_ext *dhdre;
-	struct dccp_hdr_request *dhdrr;
 	struct sockaddr_storage rcv_addr;
 	socklen_t rcv_addr_len=sizeof(struct sockaddr_storage);
-	struct sockaddr_in *iv41, *iv42;
 	struct sockaddr_in6 *tmp;
-	int opt;
+	//int opt;
 	int rlen;
 
 	dbgprintf(0, "In doping()\n");
 
 	/*Open Sockets*/
+	rs=socket(ip_type, SOCK_RAW | SOCK_NONBLOCK ,IPPROTO_RAW);
+	if(rs<0){
+		dbgprintf(0, "Error opening raw socket\n");
+		exit(1);
+	}
 	ds=socket(ip_type, SOCK_RAW | SOCK_NONBLOCK ,IPPROTO_DCCP);
 	if(ds<0){
 		dbgprintf(0, "Error opening raw DCCP socket\n");
 		exit(1);
 	}
-	/*opt=1;
-	if(setsockopt(ds,IPPROTO_IP, IP_HDRINCL, &opt, sizeof(opt))<0){
-		dbgprintf(0, "Error setting socket options on raw DCCP socket (%s)\n", strerror(errno));
-		exit(1);
-	}*/
 	is=socket(ip_type,SOCK_RAW | SOCK_NONBLOCK ,IPPROTO_ICMP);
 	if(is<0){
 		dbgprintf(0,"Error opening raw ICMP socket\n");
 		exit(1);
 	}
 
-	/*Build DCCP packet*/
-	dhdr=(struct dccp_hdr*)sbuffer;
-	dhdre=(struct dccp_hdr_ext*)(sbuffer+sizeof(struct dccp_hdr));
-	dhdrr=(struct dccp_hdr_request*)(sbuffer+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-	dhdr->dccph_ccval=0;
-	dhdr->dccph_checksum=0;
-	dhdr->dccph_cscov=0;
-	dhdr->dccph_doff=slen/4;
-	dhdr->dccph_dport=htons(dest_port);
-	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(dest_port+1);
-	dhdr->dccph_x=1;
-	dhdr->dccph_type=DCCP_PKT_REQUEST;
-	dhdr->dccph_seq2=htonl(0); //Reserved for 48 bit sequence numbers
-	dhdr->dccph_seq=htonl(0);  //just always make the high end 0
-	dhdre->dccph_seq_low=htonl(seq)>>8;
-	dhdrr->dccph_req_service= htonl(0x50455246);
-
-	opt=((unsigned char*)&dhdr->dccph_checksum) - &sbuffer[0];
+	/*opt=((unsigned char*)&dhdr->dccph_checksum) - &sbuffer[0];
 	if (setsockopt(ds, IPPROTO_IPV6, IPV6_CHECKSUM, &opt, sizeof(opt)) < 0){
 		dbgprintf(0, "Error setting up checksums on raw DCCP socket (%s)\n", strerror(errno));
 		exit(1);
-	}
+	}*/
+
+	buildPacket(sbuffer,&slen);
 	if(ip_type==AF_INET){
-		iv41=(struct sockaddr_in*)dest_addr;
-		iv42=(struct sockaddr_in*)src_addr;
-		ip4_chksum(sbuffer, slen, (unsigned char*) &iv41->sin_addr, (unsigned char*)&iv42->sin_addr, 33,&dhdr->dccph_checksum);
+		addrlen=sizeof(struct sockaddr_in);
+	}else{
+		addrlen=sizeof(struct sockaddr_in6);
 	}
 
 	while(!done){
-		rcv_addr_len=sizeof(struct sockaddr_storage);
-		if(sendto(ds, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)dest_addr,addrlen)<0){
+
+		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
 			dbgprintf(0,"Error: sendto failed\n");
 		}
-		tmp=(struct sockaddr_in6*)dest_addr;
-		dbgprintf(0, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&tmp->sin6_addr, pbuf, 1000));
 
+		if(ip_type==AF_INET){
+			dbgprintf(0, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
+		}else{
+			dbgprintf(0, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
+		}
+
+		rcv_addr_len=sizeof(struct sockaddr_storage);
 		if((rlen=recvfrom(ds, &rbuffer, 1000,MSG_DONTWAIT,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
 			if(errno!=EAGAIN){
 				dbgprintf(0, "Error on receive from DCCP socket (%s)\n",strerror(errno));
@@ -341,66 +307,82 @@ void doping(){
 		sleep(interval/1000);
 	}
 
-	close(ds);
+	close(rs);
 	close(is);
+	close(ds);
 }
 
-int ip6_chksum(unsigned char* buff, int len, unsigned char* dest, unsigned char* src, int type, unsigned short* chksum){
-	struct ip6_pseudo_hdr hdr;
+void buildPacket(unsigned char* buffer, int *len){
+	struct dccp_hdr *dhdr;
+	struct dccp_hdr_ext *dhdre;
+	struct dccp_hdr_request *dhdrr;
+	struct iphdr* ip4hdr;
+	struct ip6_hdr* ip6hdr;
 
-	//create pseudo header
-	memset(&hdr, 0, sizeof(struct ip6_pseudo_hdr));
-	memcpy(hdr.src, src, IP6_ADDR_LEN);
-	memcpy(hdr.dest, dest, IP6_ADDR_LEN);
-	hdr.nxt=type;
-	hdr.len=htonl(len);
+	int ip_hdr_len;
+	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_request);
+	int seq=8;
 
-	//calculate total checksum
-	*chksum=wrapsum(checksum((unsigned char*)&hdr,sizeof(struct ip6_pseudo_hdr),checksum(buff,len,0)));
-return 0;
-}
+	memset(buffer, 0, *len);
 
-int ip4_chksum(unsigned char* buff, int len, unsigned char* dest, unsigned char* src, int type, unsigned short* chksum){
-	struct ip4_pseudo_hdr hdr;
-
-	//create pseudo header
-	memset(&hdr, 0, sizeof(struct ip4_pseudo_hdr));
-	memcpy(hdr.src, src, IP4_ADDR_LEN);
-	memcpy(hdr.dest, dest, IP4_ADDR_LEN);
-	hdr.nxt=type;
-	hdr.len=htonl(len);
-
-	//calculate total checksum
-	*chksum=wrapsum(checksum((unsigned char*)&hdr,sizeof(struct ip4_pseudo_hdr),checksum(buff,len,0)));
-return 0;
-}
-
-u_int32_t checksum(unsigned char *buf, unsigned nbytes, u_int32_t sum)
-{
-	int i;
-	/* Checksum all the pairs of bytes first... */
-	for (i = 0; i < (nbytes & ~1U); i += 2) {
-		sum += (u_int16_t)ntohs(*((u_int16_t *)(buf + i)));
-		if (sum > 0xFFFF)
-			sum -= 0xFFFF;
+	/*IP header*/
+	ip4hdr=NULL;
+	if(ip_type==AF_INET){
+		ip_hdr_len=sizeof(struct iphdr);
+		ip4hdr=(struct iphdr*)buffer;
+		ip4hdr->check=htons(0);
+		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		ip4hdr->frag_off=htons(0);
+		ip4hdr->id=htons(1);//first
+		ip4hdr->ihl=5;
+		ip4hdr->protocol=IPPROTO_DCCP;
+		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		ip4hdr->tos=0;
+		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
+		ip4hdr->ttl=ttl;
+		ip4hdr->version=4;
+	}else{
+		ip_hdr_len=sizeof(struct ip6_hdr);
+		ip6hdr=(struct ip6_hdr*)buffer;
+		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
 	}
-	/*
-	 * If there's a single byte left over, checksum it, too.
-	 * Network byte order is big-endian, so the remaining byte is
-	 * the high byte.
-	 */
-	if (i < nbytes) {
-		sum += buf[i] << 8;
-		if (sum > 0xFFFF)
-			sum -= 0xFFFF;
-	}
-	return (sum);
-}
 
-u_int32_t wrapsum(u_int32_t sum)
-{
-	sum = ~sum & 0xFFFF;
-	return (htons(sum));
+	/*DCCP header*/
+	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
+	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
+	dhdrr=(struct dccp_hdr_request*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+	dhdr->dccph_ccval=0;
+	dhdr->dccph_checksum=0;
+	dhdr->dccph_cscov=0;
+	dhdr->dccph_doff=dccp_hdr_len/4;
+	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_reserved=0;
+	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_x=1;
+	dhdr->dccph_type=DCCP_PKT_REQUEST;
+	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
+	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
+	dhdre->dccph_seq_low=htonl(seq);
+	dhdrr->dccph_req_service= htonl(0x50455246);
+
+	/*Checksums*/
+	if(ip_type==AF_INET){
+		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv4->sin_addr,
+				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
+	}else{
+		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+	}
+	*len=ip_hdr_len+dccp_hdr_len;
+	return;
 }
 
 /*Usage information for program*/

@@ -23,8 +23,11 @@ MANDIR = /usr/local/man
 
 all: dccpping
 
-dccpping: dccpping.c
-	${CC} ${CFLAGS} ${LDLIBS}  dccpping.c -odccpping
+dccpping: dccpping.c checksums.h checksums.o Makefile
+	${CC} ${CFLAGS} ${LDLIBS}  dccpping.c checksums.o -odccpping
+	
+checksums.o: checksums.c checksums.h Makefile
+	${CC} ${CFLAGS} ${LDLIBS} -c checksums.c -ochecksums.o
 
 
 install: dccpping
