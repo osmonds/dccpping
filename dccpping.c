@@ -51,7 +51,8 @@ extern int errno;
 void getAddresses(char *src, char* dst);
 void doping();
 void handleDCCPpacket(int rcv_socket, int send_socket);
-void handleICMPpacket(int rcv_socket);
+void handleICMP4packet(int rcv_socket);
+void handleICMP6packet(int rcv_socket);
 void buildRequestPacket(unsigned char* buffer, int *len);
 void updateRequestPacket(unsigned char* buffer, int *len);
 void dbgprintf(int level, const char *fmt, ...);
@@ -224,7 +225,7 @@ void getAddresses(char *src, char* dst){
 
 /*Preform the ping functionality*/
 void doping(){
-	int rs, is,ds;
+	int rs, is4,is6,ds;
 	int done=0;
 	int addrlen;
 	int slen=1500;
@@ -245,9 +246,14 @@ void doping(){
 		dbgprintf(0, "Error opening raw DCCP socket\n");
 		exit(1);
 	}
-	is=socket(ip_type,SOCK_RAW,IPPROTO_ICMP);
-	if(is<0){
-		dbgprintf(0,"Error opening raw ICMP socket\n");
+	is4=socket(ip_type,SOCK_RAW,IPPROTO_ICMP);
+	if(is4<0){
+		dbgprintf(0,"Error opening raw ICMPv4 socket\n");
+		exit(1);
+	}
+	is6=socket(ip_type,SOCK_RAW,IPPROTO_ICMPV6);
+	if(is6<0){
+		dbgprintf(0,"Error opening raw ICMPv6 socket\n");
 		exit(1);
 	}
 
@@ -276,12 +282,16 @@ void doping(){
 		add.tv_usec=(interval%1000)*1000;
 		gettimeofday(&t,NULL);
 		timeradd(&t,&add,&delay);
-		FD_ZERO(&sel);
-		FD_SET(ds,&sel);
-		FD_SET(is,&sel);
 		while(timercmp(&t,&delay,<)){
+			/*Prepare for select*/
+			FD_ZERO(&sel);
+			FD_SET(ds,&sel);
+			FD_SET(is4,&sel);
+			FD_SET(is6,&sel);
 			timersub(&delay,&t,&timeout);
-			if(select(MAX(ds+1,is+1),&sel, NULL,NULL,&timeout)<0){
+
+			/*Do select call*/
+			if(select(MAX(ds+1,MAX(is4+1,is6+1)),&sel, NULL,NULL,&timeout)<0){
 				dbgprintf(0,"Select() error\n");
 			}
 
@@ -290,9 +300,13 @@ void doping(){
 				handleDCCPpacket(ds,rs);
 
 			}
-			if(FD_ISSET(is,&sel)){
-				/*Data on the ICMP socket*/
-				handleICMPpacket(is);
+			if(FD_ISSET(is4,&sel) && ip_type==AF_INET){
+				/*Data on the ICMPv4 socket*/
+				handleICMP4packet(is4);
+			}
+			if(FD_ISSET(is6,&sel) && ip_type==AF_INET6){
+				/*Data on the ICMPv6 socket*/
+				handleICMP6packet(is6);
 			}
 			gettimeofday(&t,NULL);
 		}
@@ -310,7 +324,8 @@ void doping(){
 	}
 
 	close(rs);
-	close(is);
+	close(is4);
+	close(is6);
 	close(ds);
 }
 
@@ -412,75 +427,63 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	free(rcv_addr.gen);
 }
 
-void handleICMPpacket(int rcv_socket){
+void handleICMP4packet(int rcv_socket){
 	int rlen=1500;
 	unsigned char rbuffer[rlen];
 	char pbuf[1000];
-	ipaddr_ptr_t rcv_addr;
-	socklen_t rcv_addr_len;
+	struct sockaddr_in rcv_addr;
+	socklen_t rcv_addr_len=sizeof(struct sockaddr_in);
 	struct icmphdr *icmp4;
-	struct icmp6_hdr *icmp6;
-
-	/*Memory for socket address*/
-	rcv_addr_len=sizeof(struct sockaddr_storage);
-	rcv_addr.gen=malloc(rcv_addr_len);
-	if(rcv_addr.gen==NULL){
-		dbgprintf(0,"Error: Can't Allocate Memory!\n");
-		exit(1);
-	}
 
 	/*Receive Packet*/
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
 		dbgprintf(0, "Error on receive from ICMP socket (%s)\n",strerror(errno));
 	}
 
-	if(rcv_addr.gen->sa_family!=ip_type){ //confirm IP type
-		dbgprintf(1, "ICMP packet on %s. Tossing.\n", (ip_type==AF_INET) ? "IPv4" : "IPv6");
-		free(rcv_addr.gen);
+	if(rlen < sizeof(struct icmphdr)){ //check packet size
+		dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
 		return;
 	}
 
-	if(rcv_addr.gen->sa_family==AF_INET){
-		/*IPv4*/
-		if(rlen < sizeof(struct icmphdr)){ //check packet size
-			dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
-			free(rcv_addr.gen);
-			return;
-		}
-
-		icmp4=(struct icmphdr*)rbuffer;
-		if(icmp4->type!=3 && icmp4->type!=11){ //check icmp types
-			dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp4->type);
-			free(rcv_addr.gen);
-			return;
-		}
-
-		/*Print Message*/
-		dbgprintf(0, "Got ICMPv4 type %i from %s\n", icmp4->type,
-				inet_ntop(ip_type, (void*)&rcv_addr.ipv4->sin_addr, pbuf, 1000));
-
-	}else{
-		/*IPv6*/
-		if(rlen < sizeof(struct icmp6_hdr)){ //check packet size
-			dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
-			free(rcv_addr.gen);
-			return;
-		}
-
-		icmp6=(struct icmp6_hdr*)rbuffer;
-		if(icmp6->icmp6_type!=1 && icmp6->icmp6_type!=2 && icmp6->icmp6_type!=3
-				&& icmp6->icmp6_type!=4){ //check icmp types
-			dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp6->icmp6_type);
-			free(rcv_addr.gen);
-			return;
-		}
-
-		/*Print Message*/
-		dbgprintf(0, "Got ICMPv6 type %i from %s\n", icmp6->icmp6_type,
-				inet_ntop(ip_type, (void*)&rcv_addr.ipv6->sin6_addr, pbuf, 1000));
+	icmp4=(struct icmphdr*)rbuffer;
+	if(icmp4->type!=3 && icmp4->type!=11){ //check icmp types
+		dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp4->type);
+		return;
 	}
 
-	free(rcv_addr.gen);
+	/*Print Message*/
+	dbgprintf(0, "Got ICMPv4 type %i from %s\n", icmp4->type,
+			inet_ntop(ip_type, (void*)&rcv_addr.sin_addr, pbuf, 1000));
+}
+
+void handleICMP6packet(int rcv_socket){
+	int rlen=1500;
+	unsigned char rbuffer[rlen];
+	char pbuf[1000];
+	struct sockaddr_in6 rcv_addr;
+	socklen_t rcv_addr_len=sizeof(struct sockaddr_in6);
+	struct icmp6_hdr *icmp6;
+
+	/*Receive Packet*/
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
+		dbgprintf(0, "Error on receive from ICMP socket (%s)\n",strerror(errno));
+	}
+
+	if(rlen < sizeof(struct icmp6_hdr)){ //check packet size
+		dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
+		return;
+	}
+
+	icmp6=(struct icmp6_hdr*)rbuffer;
+	if(icmp6->icmp6_type!=1 && icmp6->icmp6_type!=2 && icmp6->icmp6_type!=3
+			&& icmp6->icmp6_type!=4){ //check icmp types
+		dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp6->icmp6_type);
+		return;
+	}
+
+	/*Print Message*/
+	dbgprintf(0, "Got ICMPv6 type %i from %s\n", icmp6->icmp6_type,
+			inet_ntop(ip_type, (void*)&rcv_addr.sin6_addr, pbuf, 1000));
 }
 
 void buildRequestPacket(unsigned char* buffer, int *len){
