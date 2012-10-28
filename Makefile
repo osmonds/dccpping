@@ -13,7 +13,7 @@ CFLAGS= -O2 -Wall -Werror -g --std=gnu99
 # for HP, I'm told that you need:
 #	LDLIBS = -lstr
 # everybody else (that I know of) just needs:
-#	LDLIBS =
+#	LDLIBS = 
 LDLIBS =
 
 CC = gcc

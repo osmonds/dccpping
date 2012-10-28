@@ -9,6 +9,14 @@ Description: IPv4 and IPv6 Checksum code
 #include <arpa/inet.h>
 #include "checksums.h"
 
+/*Stupid Solaris*/
+#ifndef u_int32_t
+#define u_int32_t uint32_t
+#endif
+#ifndef u_int16_t
+#define u_int16_t uint16_t
+#endif
+
 //Pseudo Headers for checksums
 struct ip6_pseudo_hdr{
 	unsigned char src[IP6_ADDR_LEN];
