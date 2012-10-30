@@ -336,6 +336,8 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	ipaddr_ptr_t rcv_addr;
 	socklen_t rcv_addr_len;
 	struct dccp_hdr *dhdr;
+	unsigned char* ptr;
+	struct iphdr* iph;
 
 	/*Memory for socket address*/
 	rcv_addr_len=sizeof(struct sockaddr_storage);
@@ -357,13 +359,6 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		return;
 	}
 
-	if(rlen < sizeof(struct dccp_hdr)){ //check packet size
-		dbgprintf(1, "Packet smaller than possible DCCP packet received on DCCP socket\n");
-		free(rcv_addr.gen);
-		return;
-	}
-
-	/*Check IP source*/
 	if(rcv_addr.gen->sa_family==AF_INET){
 		/*IPv4*/
 		if(memcmp(&rcv_addr.ipv4->sin_addr,&dest_addr.ipv4->sin_addr,
@@ -372,6 +367,14 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 			free(rcv_addr.gen);
 			return;
 		}
+		if(rlen < sizeof(struct dccp_hdr)+sizeof(struct iphdr)){ //check packet size
+
+			dbgprintf(1, "Packet smaller than possible DCCP packet received on DCCP socket\n");
+			free(rcv_addr.gen);
+			return;
+		}
+		iph=(struct iphdr*)rbuffer;
+		ptr=rbuffer+iph->ihl*4;
 	}else{
 		/*IPv6*/
 		if(memcmp(&rcv_addr.ipv6->sin6_addr, &dest_addr.ipv6->sin6_addr,
@@ -380,12 +383,19 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 			free(rcv_addr.gen);
 			return;
 		}
+		if(rlen < sizeof(struct dccp_hdr)){ //check packet size
+
+			dbgprintf(1, "Packet smaller than possible DCCP packet received on DCCP socket\n");
+			free(rcv_addr.gen);
+			return;
+		}
+		ptr=rbuffer;
 	}
 
 	/*DCCP checks*/
-	dhdr=(struct dccp_hdr*)rbuffer;
+	dhdr=(struct dccp_hdr*)ptr;
 	if(dhdr->dccph_sport!=htons(dest_port)){
-		dbgprintf(1,"DCCP packet with wrong Source Port\n");
+		dbgprintf(1,"DCCP packet with wrong Source Port (%i)\n", ntohs(dhdr->dccph_sport));
 		free(rcv_addr.gen);
 		return;
 	}
@@ -437,17 +447,17 @@ void handleICMP4packet(int rcv_socket){
 
 	/*Receive Packet*/
 	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
-		dbgprintf(0, "Error on receive from ICMP socket (%s)\n",strerror(errno));
+		dbgprintf(0, "Error on receive from ICMPv4 socket (%s)\n",strerror(errno));
 	}
 
 	if(rlen < sizeof(struct icmphdr)){ //check packet size
-		dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
+		dbgprintf(1, "Packet smaller than possible ICMPv4 packet!\n");
 		return;
 	}
 
 	icmp4=(struct icmphdr*)rbuffer;
 	if(icmp4->type!=3 && icmp4->type!=11){ //check icmp types
-		dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp4->type);
+		dbgprintf(1, "Tossing ICMPv4 packet of type %i\n", icmp4->type);
 		return;
 	}
 
@@ -466,18 +476,18 @@ void handleICMP6packet(int rcv_socket){
 
 	/*Receive Packet*/
 	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
-		dbgprintf(0, "Error on receive from ICMP socket (%s)\n",strerror(errno));
+		dbgprintf(0, "Error on receive from ICMPv6 socket (%s)\n",strerror(errno));
 	}
 
 	if(rlen < sizeof(struct icmp6_hdr)){ //check packet size
-		dbgprintf(1, "Packet smaller than possible ICMP packet!\n");
+		dbgprintf(1, "Packet smaller than possible ICMPv6 packet!\n");
 		return;
 	}
 
 	icmp6=(struct icmp6_hdr*)rbuffer;
 	if(icmp6->icmp6_type!=1 && icmp6->icmp6_type!=2 && icmp6->icmp6_type!=3
 			&& icmp6->icmp6_type!=4){ //check icmp types
-		dbgprintf(1, "Tossing ICMP packet of type %i\n", icmp6->icmp6_type);
+		dbgprintf(1, "Tossing ICMPv6 packet of type %i\n", icmp6->icmp6_type);
 		return;
 	}
 
