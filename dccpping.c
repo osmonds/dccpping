@@ -12,6 +12,7 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 #include <strings.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -109,9 +110,11 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq);
 void updateRequestPacket(unsigned char* buffer, int *len, int seq);
 int logPacket(int seq);
 int logResponse(ipaddr_ptr_t *src, int seq, int type);
-void dbgprintf(int level, const char *fmt, ...);
-void sanitize_environment();
+void clearQueue();
+void sigHandler();
 void usage();
+void sanitize_environment();
+void dbgprintf(int level, const char *fmt, ...);
 
 
 /*Parse commandline options*/
@@ -188,10 +191,12 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+	signal(SIGINT, sigHandler);
 	doping();
 
 	free(src_addr.gen);
 	free(dest_addr.gen);
+	clearQueue();
 	return 0;
 }
 
@@ -340,8 +345,12 @@ void doping(){
 	while(!done){
 		/*Send Ping*/
 		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
-			dbgprintf(0,"Error: sendto failed\n");
+			if(errno!=EINTR){
+				dbgprintf(0,"Error: sendto failed\n");
+			}
 		}
+		if(count==0){done=1; break;}
+
 		if (logPacket(seq)<0){
 			dbgprintf(0,"Error: Couldn't record request!\n");
 		}
@@ -366,8 +375,11 @@ void doping(){
 
 			/*Do select call*/
 			if(select(MAX(ds+1,MAX(is4+1,is6+1)),&sel, NULL,NULL,&timeout)<0){
-				dbgprintf(0,"Select() error\n");
+				if(errno!=EINTR){
+					dbgprintf(0,"Select() error (%s)\n",strerror(errno));
+				}
 			}
+			if(count==0){done=1;break;}
 
 			if(FD_ISSET(ds,&sel)){
 				/*Data on the DCCP socket*/
@@ -388,10 +400,6 @@ void doping(){
 		/*Update count*/
 		if(count>-1){
 			count--;
-		}
-		if(count==0){
-			done=1;
-			break;
 		}
 		seq++;
 		updateRequestPacket(sbuffer,&slen, seq);
@@ -426,7 +434,12 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	/*Receive Packet*/
 	rcv_addr_len=sizeof(struct sockaddr_storage);
 	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
+		if(errno!=EINTR){
 			dbgprintf(0, "Error on receive from DCCP socket (%s)\n",strerror(errno));
+		}
+	}
+	if(rlen<0){
+		return;
 	}
 
 	if(rcv_addr.gen->sa_family!=ip_type){ //confirm IP type
@@ -534,7 +547,12 @@ void handleICMP4packet(int rcv_socket){
 
 	/*Receive Packet*/
 	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
-		dbgprintf(0, "Error on receive from ICMPv4 socket (%s)\n",strerror(errno));
+		if(errno!=EINTR){
+			dbgprintf(0, "Error on receive from ICMPv4 socket (%s)\n",strerror(errno));
+		}
+	}
+	if(rlen<0){
+		return;
 	}
 
 	if(rlen < sizeof(struct icmphdr)){ //check packet size
@@ -834,11 +852,11 @@ int logPacket(int seq){
 
 	if(queue.head==NULL){
 		queue.head=queue.tail=tmp;
-		return 0;
+	}else{
+		queue.head->prev=tmp;
+		tmp->next=queue.head;
+		queue.head=tmp;
 	}
-	queue.head->prev=tmp;
-	tmp->next=queue.head;
-	queue.head=tmp;
 
 	/*Update Statistics*/
 	if(ping_stats.requests_sent==0){
@@ -863,6 +881,9 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	while(cur!=NULL){
 		if(cur->seq==seq){
 			gettimeofday(&cur->reply,NULL);
+			if(cur->num_replies>0){
+				dbgprintf(0,"Duplicate packet detected! (%i)\n", seq);
+			}
 			if(type<DEST_UNREACHABLE && type!=UNKNOWN){
 				cur->num_replies++;
 			}else{
@@ -908,9 +929,13 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	/*Update statistics*/
 	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
 		/*Good Response*/
-		ping_stats.rtt_avg=((ping_stats.replies_received*ping_stats.rtt_avg)+(diff))/(ping_stats.replies_received+1);
-		ping_stats.replies_received++;
-		if(diff < ping_stats.rtt_min){
+		if(cur->num_replies==1){
+			ping_stats.rtt_avg=((ping_stats.replies_received*ping_stats.rtt_avg)+(diff))/(ping_stats.replies_received+1);
+			ping_stats.replies_received++;
+		}else{
+			ping_stats.errors++;
+		}
+		if(diff < ping_stats.rtt_min || ping_stats.rtt_min==0){
 			ping_stats.rtt_min=diff;
 		}
 		if(diff > ping_stats.rtt_max){
@@ -918,10 +943,53 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 		}
 	}else{
 		/*Error*/
-		cur->num_errors++;
+		ping_stats.errors++;
 	}
 	gettimeofday(&ping_stats.stop,NULL);
 	return 0;
+}
+
+void clearQueue(){
+	struct request *cur;
+	struct request *tmp;
+
+	cur=queue.head;
+	while(cur!=NULL){
+		tmp=cur;
+		cur=cur->next;
+		free(tmp);
+	}
+	queue.head=NULL;
+	queue.tail=NULL;
+	return;
+}
+
+void sigHandler(){
+	char pbuf[1000];
+	int diff;
+	double ploss;
+
+	/*Print Stats*/
+	if(ip_type==AF_INET){
+		dbgprintf(0,"-----------%s PING STATISTICS-----------\n",
+				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
+	}else if(ip_type==AF_INET6){
+		dbgprintf(0,"-----------%s PING STATISTICS-----------\n",
+				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
+	}
+	diff=(ping_stats.stop.tv_usec + 1000000*ping_stats.stop.tv_sec) -
+			(ping_stats.start.tv_usec + 1000000*ping_stats.start.tv_sec);
+	diff=diff/1000.0;
+	ploss=(1.0*(ping_stats.requests_sent-ping_stats.replies_received)/ping_stats.requests_sent*1.0)*100;
+	dbgprintf(0,"%i packets transmitted, %i received, %i errors, %.2f%% loss, time %ims\n",
+			ping_stats.requests_sent,ping_stats.replies_received,ping_stats.errors,
+			ploss,diff);
+	dbgprintf(0,"rtt min/avg/max = %.1f/%.1f/%.1f ms\n",
+			ping_stats.rtt_min,ping_stats.rtt_avg,ping_stats.rtt_max);
+
+
+	/*Exit Quickly*/
+	count=0;
 }
 
 /*Usage information for program*/
