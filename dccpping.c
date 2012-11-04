@@ -46,7 +46,8 @@ enum responses{
 	DEST_UNREACHABLE,
 	TTL_EXPIRATION,
 	TOO_BIG,
-	PARAMETER_PROBLEM
+	PARAMETER_PROBLEM,
+	DCCP_ERROR
 };
 char* response_label[]= {
 "Unknown",
@@ -56,7 +57,8 @@ char* response_label[]= {
 "Destination Unreachable",
 "TTL Expiration",
 "Packet Too Big",
-"DCCP Not Supported (Parameter Problem)"
+"DCCP Not Supported (Parameter Problem)",
+"Protocol Error (DCCP Reset)"
 };
 
 
@@ -108,6 +110,8 @@ void handleICMP4packet(int rcv_socket);
 void handleICMP6packet(int rcv_socket);
 void buildRequestPacket(unsigned char* buffer, int *len, int seq);
 void updateRequestPacket(unsigned char* buffer, int *len, int seq);
+void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
+void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
 int logPacket(int seq);
 int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void clearQueue();
@@ -418,6 +422,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	socklen_t rcv_addr_len;
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_reset *dhdr_re;
+	struct dccp_hdr_ext *dhdre;
 	struct dccp_hdr_response *dhdr_rp;
 	struct dccp_hdr_ack_bits *dhdr_sync;
 	unsigned char* ptr;
@@ -501,7 +506,13 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 			return;
 		}
 		dhdr_re=(struct dccp_hdr_reset*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-		logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), RESET);
+
+		/*Log*/
+		if(dhdr_re->dccph_reset_code==DCCP_RESET_CODE_NO_CONNECTION){
+			logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), RESET);
+		}else{
+			logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), DCCP_ERROR);
+		}
 		/*Nothing else to do*/
 	}
 	if(dhdr->dccph_type==DCCP_PKT_RESPONSE){
@@ -509,18 +520,30 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 			dbgprintf(1, "Error: Response packet too small!");
 			return;
 		}
+
+		/*Log*/
+		dhdre=(struct dccp_hdr_ext*)(ptr+sizeof(struct dccp_hdr));
 		dhdr_rp=(struct dccp_hdr_response*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
 		logResponse(&rcv_addr,ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),RESPONSE);
-		/*TODO:Send Close back*/
+
+		/*Send Close*/
+		sendClose(ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),
+				dhdr->dccph_seq, dhdre->dccph_seq_low,send_socket);
 	}
 	if(dhdr->dccph_type==DCCP_PKT_SYNC || dhdr->dccph_type==DCCP_PKT_SYNCACK){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits)){
 			dbgprintf(1, "Error: Response packet too small!");
 			return;
 		}
+
+		/*Log*/
+		dhdre=(struct dccp_hdr_ext*)(ptr+sizeof(struct dccp_hdr));
 		dhdr_sync=(struct dccp_hdr_ack_bits*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
 		logResponse(&rcv_addr,ntohl(dhdr_sync->dccph_ack_nr_low),SYNC);
-		/*TODO:Send Reset*/
+
+		/*Send Reset*/
+		sendReset(ntohl(dhdr_sync->dccph_ack_nr_low),
+						dhdr->dccph_seq, dhdre->dccph_seq_low,send_socket);
 	}
 
 	free(rcv_addr.gen);
@@ -579,16 +602,19 @@ void handleICMP4packet(int rcv_socket){
 	ip4hdr=(struct iphdr*)(rbuffer+sizeof(struct icmphdr));
 	if(memcmp(&src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(src_addr.ipv4->sin_addr))!=0){
 		/*Source address doesn't match*/
+		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 source address isn't us\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(memcmp(&dest_addr.ipv4->sin_addr,&ip4hdr->daddr,sizeof(dest_addr.ipv4->sin_addr))!=0){
 		/*Destination address doesn't match*/
+		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 destination address isn't our target\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(ip4hdr->protocol!=IPPROTO_DCCP){
 		/*Not DCCP!*/
+		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet isn't DCCP\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -597,11 +623,13 @@ void handleICMP4packet(int rcv_socket){
 	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4);
 	if(dhdr->dccph_dport!=htons(dest_port)){
 		/*DCCP Destination Ports don't match*/
+		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(dhdr->dccph_sport!=htons(dest_port)){
 		/*DCCP Source Ports don't match*/
+		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -667,17 +695,20 @@ void handleICMP6packet(int rcv_socket){
 	/*Decode IPv6 header*/
 	ip6hdr=(struct ip6_hdr*)(rbuffer+sizeof(struct icmp6_hdr));
 	if(memcmp(&src_addr.ipv6->sin6_addr,&ip6hdr->ip6_src,sizeof(src_addr.ipv6->sin6_addr))!=0){
+		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 source address isn't us\n");
 		/*Source address doesn't match*/
 		free(rcv_addr.gen);
 		return;
 	}
 	if(memcmp(&dest_addr.ipv6->sin6_addr,&ip6hdr->ip6_dst,sizeof(dest_addr.ipv6->sin6_addr))!=0){
 		/*Destination address doesn't match*/
+		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 destination address isn't our target\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt!=IPPROTO_DCCP){
 		/*Not DCCP!*/
+		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet isn't DCCP\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -686,17 +717,17 @@ void handleICMP6packet(int rcv_socket){
 	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr));
 	if(dhdr->dccph_dport!=htons(dest_port)){
 		/*DCCP Destination Ports don't match*/
+		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(dhdr->dccph_sport!=htons(dest_port)){
 		/*DCCP Source Ports don't match*/
+		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	dhdre=(struct dccp_hdr_ext*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr)+sizeof(struct dccp_hdr));
-
-
 
 	/*Log*/
 	if(icmp6->icmp6_type==ICMP6_DST_UNREACH){
@@ -830,6 +861,186 @@ void updateRequestPacket(unsigned char* buffer, int *len, int seq){
 				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	*len=ip_hdr_len+dccp_hdr_len;
+	return;
+}
+
+void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
+	unsigned char buffer[1500];
+	struct dccp_hdr *dhdr;
+	struct dccp_hdr_ext *dhdre;
+	struct dccp_hdr_ack_bits *dhd_ack;
+	struct iphdr* ip4hdr;
+	struct ip6_hdr* ip6hdr;
+	int len;
+	int addrlen;
+
+	int ip_hdr_len;
+	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits);
+
+	memset(buffer, 0, 1500);
+
+	/*IP header*/
+	ip4hdr=NULL;
+	if(ip_type==AF_INET){
+		ip_hdr_len=sizeof(struct iphdr);
+		ip4hdr=(struct iphdr*)buffer;
+		ip4hdr->check=htons(0);
+		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		ip4hdr->frag_off=htons(0);
+		ip4hdr->id=htons(1);//first
+		ip4hdr->ihl=5;
+		ip4hdr->protocol=IPPROTO_DCCP;
+		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		ip4hdr->tos=0;
+		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
+		ip4hdr->ttl=ttl;
+		ip4hdr->version=4;
+	}else{
+		ip_hdr_len=sizeof(struct ip6_hdr);
+		ip6hdr=(struct ip6_hdr*)buffer;
+		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
+	}
+
+	/*DCCP header*/
+	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
+	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
+	dhd_ack=(struct dccp_hdr_ack_bits*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+	dhdr->dccph_ccval=0;
+	dhdr->dccph_checksum=0;
+	dhdr->dccph_cscov=0;
+	dhdr->dccph_doff=dccp_hdr_len/4;
+	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_reserved=0;
+	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_x=1;
+	dhdr->dccph_type=DCCP_PKT_CLOSE;
+	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
+	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
+	dhdre->dccph_seq_low=htonl(seq+1);
+	dhd_ack->dccph_ack_nr_high=ack_h;
+	dhd_ack->dccph_ack_nr_low=ack_l;
+
+	/*Checksums*/
+	if(ip_type==AF_INET){
+		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv4->sin_addr,
+				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
+	}else{
+		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+	}
+	len=ip_hdr_len+dccp_hdr_len;
+
+	/*Send*/
+	if(ip_type==AF_INET){
+		addrlen=sizeof(struct sockaddr_in);
+	}else{
+		addrlen=sizeof(struct sockaddr_in6);
+	}
+	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
+		if(errno!=EINTR){
+			dbgprintf(0,"Error: sendto failed\n");
+		}
+	}
+	return;
+}
+
+void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
+	unsigned char buffer[1500];
+	struct dccp_hdr *dhdr;
+	struct dccp_hdr_ext *dhdre;
+	struct dccp_hdr_reset *dh_re;
+	struct iphdr* ip4hdr;
+	struct ip6_hdr* ip6hdr;
+	int len;
+	int addrlen;
+
+	int ip_hdr_len;
+	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_reset);
+
+	memset(buffer, 0, 1500);
+
+	/*IP header*/
+	ip4hdr=NULL;
+	if(ip_type==AF_INET){
+		ip_hdr_len=sizeof(struct iphdr);
+		ip4hdr=(struct iphdr*)buffer;
+		ip4hdr->check=htons(0);
+		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		ip4hdr->frag_off=htons(0);
+		ip4hdr->id=htons(1);//first
+		ip4hdr->ihl=5;
+		ip4hdr->protocol=IPPROTO_DCCP;
+		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		ip4hdr->tos=0;
+		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
+		ip4hdr->ttl=ttl;
+		ip4hdr->version=4;
+	}else{
+		ip_hdr_len=sizeof(struct ip6_hdr);
+		ip6hdr=(struct ip6_hdr*)buffer;
+		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
+	}
+
+	/*DCCP header*/
+	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
+	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
+	dh_re=(struct dccp_hdr_reset*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+	dhdr->dccph_ccval=0;
+	dhdr->dccph_checksum=0;
+	dhdr->dccph_cscov=0;
+	dhdr->dccph_doff=dccp_hdr_len/4;
+	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_reserved=0;
+	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_x=1;
+	dhdr->dccph_type=DCCP_PKT_RESET;
+	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
+	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
+	dhdre->dccph_seq_low=htonl(seq+1);
+	dh_re->dccph_reset_ack.dccph_ack_nr_high=ack_h;
+	dh_re->dccph_reset_ack.dccph_ack_nr_low=ack_l;
+	dh_re->dccph_reset_code=DCCP_RESET_CODE_CLOSED;
+	dh_re->dccph_reset_data[0]=0;
+	dh_re->dccph_reset_data[1]=0;
+	dh_re->dccph_reset_data[2]=0;
+
+	/*Checksums*/
+	if(ip_type==AF_INET){
+		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv4->sin_addr,
+				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
+	}else{
+		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
+				(unsigned char*) &dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+	}
+	len=ip_hdr_len+dccp_hdr_len;
+
+	/*Send*/
+	if(ip_type==AF_INET){
+		addrlen=sizeof(struct sockaddr_in);
+	}else{
+		addrlen=sizeof(struct sockaddr_in6);
+	}
+	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
+		if(errno!=EINTR){
+			dbgprintf(0,"Error: sendto failed\n");
+		}
+	}
 	return;
 }
 
