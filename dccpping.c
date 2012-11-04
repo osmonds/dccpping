@@ -30,11 +30,61 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 
 
 #define MAX(x,y) (x>y ? x : y)
+/*Structure for simpler IPv4/IPv6 Address handling*/
 typedef union ipaddr{
 	struct sockaddr *gen;
 	struct sockaddr_in *ipv4;
 	struct sockaddr_in6 *ipv6;
 } ipaddr_ptr_t;
+
+enum responses{
+	UNKNOWN=0,
+	RESET,
+	RESPONSE,
+	SYNC,
+	DEST_UNREACHABLE,
+	TTL_EXPIRATION,
+	TOO_BIG,
+	PARAMETER_PROBLEM
+};
+char* response_label[]= {
+"Unknown",
+"Closed Port (Reset)",
+"Open Port (Response)",
+"Open Port (Sync)",
+"Destination Unreachable",
+"TTL Expiration",
+"Packet Too Big",
+"DCCP Not Supported (Parameter Problem)"
+};
+
+
+struct request{
+	int				seq;
+	int				num_replies;
+	int				num_errors;
+	struct timeval	sent;
+	struct timeval	reply;
+	enum responses	reply_type;
+	struct request  *next;
+	struct request  *prev;
+};
+
+struct stats{
+	int				requests_sent;
+	int				replies_received;
+	int				errors;
+	double  		rtt_min;
+	double			rtt_avg;
+	double 			rtt_max;
+	struct timeval 	start;
+	struct timeval 	stop;
+};
+
+struct request_queue{
+	struct request *head;
+	struct request *tail;
+};
 
 
 int debug=0;			/*set to 1 to turn on debugging information*/
@@ -43,8 +93,10 @@ int dest_port=33434;	/*Default port*/
 int ttl=64;				/*Default TTL*/
 long interval=1000;		/*Default delay between pings in ms*/
 int ip_type=AF_UNSPEC;	/*IPv4 or IPv6*/
-ipaddr_ptr_t dest_addr;
-ipaddr_ptr_t src_addr;
+ipaddr_ptr_t dest_addr;	/*Destination Address*/
+ipaddr_ptr_t src_addr;	/*Source Address*/
+struct request_queue 	queue;
+struct stats			ping_stats;
 extern int errno;
 
 
@@ -53,8 +105,10 @@ void doping();
 void handleDCCPpacket(int rcv_socket, int send_socket);
 void handleICMP4packet(int rcv_socket);
 void handleICMP6packet(int rcv_socket);
-void buildRequestPacket(unsigned char* buffer, int *len);
-void updateRequestPacket(unsigned char* buffer, int *len);
+void buildRequestPacket(unsigned char* buffer, int *len, int seq);
+void updateRequestPacket(unsigned char* buffer, int *len, int seq);
+int logPacket(int seq);
+int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void dbgprintf(int level, const char *fmt, ...);
 void sanitize_environment();
 void usage();
@@ -66,7 +120,14 @@ int main(int argc, char *argv[])
 	char c;
 	char *src=NULL;
 	char *dst=NULL;
-
+	queue.head=NULL;
+	queue.tail=NULL;
+	ping_stats.replies_received=0;
+	ping_stats.requests_sent=0;
+	ping_stats.rtt_avg=0;
+	ping_stats.rtt_max=0;
+	ping_stats.rtt_min=0;
+	ping_stats.errors=0;
 
 	sanitize_environment();
 
@@ -234,6 +295,7 @@ void doping(){
 	struct timeval timeout;
 	struct timeval t,delay, add;
 	char pbuf[1000];
+	int seq=1;
 
 	/*Open Sockets*/
 	rs=socket(ip_type, SOCK_RAW ,IPPROTO_RAW);
@@ -259,11 +321,20 @@ void doping(){
 
 
 	/*Build DCCP packet*/
-	buildRequestPacket(sbuffer,&slen);
+	buildRequestPacket(sbuffer,&slen,seq);
 	if(ip_type==AF_INET){
 		addrlen=sizeof(struct sockaddr_in);
 	}else{
 		addrlen=sizeof(struct sockaddr_in6);
+	}
+
+	/*Start Message*/
+	if(ip_type==AF_INET){
+		dbgprintf(0, "PINGING %s on DCCP port %i\n",
+				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000),dest_port);
+	}else{
+		dbgprintf(0, "PINGING %s on DCCP port %i\n",
+				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000),dest_port);
 	}
 
 	while(!done){
@@ -271,10 +342,13 @@ void doping(){
 		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
 			dbgprintf(0,"Error: sendto failed\n");
 		}
+		if (logPacket(seq)<0){
+			dbgprintf(0,"Error: Couldn't record request!\n");
+		}
 		if(ip_type==AF_INET){
-			dbgprintf(0, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
+			dbgprintf(1, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
 		}else{
-			dbgprintf(0, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
+			dbgprintf(1, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
 		}
 
 		/*Use select to wait on packets or until interval has passed*/
@@ -319,8 +393,8 @@ void doping(){
 			done=1;
 			break;
 		}
-
-		updateRequestPacket(sbuffer,&slen);
+		seq++;
+		updateRequestPacket(sbuffer,&slen, seq);
 	}
 
 	close(rs);
@@ -332,10 +406,12 @@ void doping(){
 void handleDCCPpacket(int rcv_socket, int send_socket){
 	int rlen=1500;
 	unsigned char rbuffer[rlen];
-	char pbuf[1000];
 	ipaddr_ptr_t rcv_addr;
 	socklen_t rcv_addr_len;
 	struct dccp_hdr *dhdr;
+	struct dccp_hdr_reset *dhdr_re;
+	struct dccp_hdr_response *dhdr_rp;
+	struct dccp_hdr_ack_bits *dhdr_sync;
 	unsigned char* ptr;
 	struct iphdr* iph;
 
@@ -405,33 +481,33 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		return;
 	}
 
-	/*Print Message*/
+	/*Pick Response*/
 	if(dhdr->dccph_type==DCCP_PKT_RESET){
-		/*Print Message*/
-		if(ip_type==AF_INET){
-			dbgprintf(0, "Got DCCP RESET from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv4->sin_addr, pbuf, 1000));
-		}else{
-			dbgprintf(0, "Got DCCP RESET from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv6->sin6_addr, pbuf, 1000));
+		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_reset)){
+			dbgprintf(1, "Error: Reset packet too small!");
+			return;
 		}
+		dhdr_re=(struct dccp_hdr_reset*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+		logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), RESET);
 		/*Nothing else to do*/
 	}
 	if(dhdr->dccph_type==DCCP_PKT_RESPONSE){
-		/*Print Message*/
-		if(ip_type==AF_INET){
-			dbgprintf(0, "Got DCCP RESPONSE from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv4->sin_addr, pbuf, 1000));
-		}else{
-			dbgprintf(0, "Got DCCP RESPONSE from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv6->sin6_addr, pbuf, 1000));
+		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_response)){
+			dbgprintf(1, "Error: Response packet too small!");
+			return;
 		}
-		/*Send Close back*/
+		dhdr_rp=(struct dccp_hdr_response*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+		logResponse(&rcv_addr,ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),RESPONSE);
+		/*TODO:Send Close back*/
 	}
 	if(dhdr->dccph_type==DCCP_PKT_SYNC || dhdr->dccph_type==DCCP_PKT_SYNCACK){
-		/*Print Message*/
-		if(ip_type==AF_INET){
-			dbgprintf(0, "Got DCCP SYNC from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv4->sin_addr, pbuf, 1000));
-		}else{
-			dbgprintf(0, "Got DCCP SYNC from %s\n",inet_ntop(ip_type, (void*)&rcv_addr.ipv6->sin6_addr, pbuf, 1000));
+		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits)){
+			dbgprintf(1, "Error: Response packet too small!");
+			return;
 		}
-		/*Send Reset*/
+		dhdr_sync=(struct dccp_hdr_ack_bits*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
+		logResponse(&rcv_addr,ntohl(dhdr_sync->dccph_ack_nr_low),SYNC);
+		/*TODO:Send Reset*/
 	}
 
 	free(rcv_addr.gen);
@@ -440,63 +516,189 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 void handleICMP4packet(int rcv_socket){
 	int rlen=1500;
 	unsigned char rbuffer[rlen];
-	char pbuf[1000];
-	struct sockaddr_in rcv_addr;
-	socklen_t rcv_addr_len=sizeof(struct sockaddr_in);
+	ipaddr_ptr_t rcv_addr;
+	socklen_t rcv_addr_len;
 	struct icmphdr *icmp4;
+	struct dccp_hdr *dhdr;
+	struct dccp_hdr_ext *dhdre;
+	struct iphdr* ip4hdr;
+	int type;
+
+	/*Memory for socket address*/
+	rcv_addr_len=sizeof(struct sockaddr_storage);
+	rcv_addr.gen=malloc(rcv_addr_len);
+	if(rcv_addr.gen==NULL){
+		dbgprintf(0,"Error: Can't Allocate Memory!\n");
+		exit(1);
+	}
 
 	/*Receive Packet*/
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
 		dbgprintf(0, "Error on receive from ICMPv4 socket (%s)\n",strerror(errno));
 	}
 
 	if(rlen < sizeof(struct icmphdr)){ //check packet size
 		dbgprintf(1, "Packet smaller than possible ICMPv4 packet!\n");
+		free(rcv_addr.gen);
 		return;
 	}
 
 	icmp4=(struct icmphdr*)rbuffer;
-	if(icmp4->type!=3 && icmp4->type!=11){ //check icmp types
+	if(icmp4->type!=ICMP_DEST_UNREACH && icmp4->type!=ICMP_TIME_EXCEEDED){ //check icmp types
 		dbgprintf(1, "Tossing ICMPv4 packet of type %i\n", icmp4->type);
+		free(rcv_addr.gen);
 		return;
 	}
 
-	/*Print Message*/
-	dbgprintf(0, "Got ICMPv4 type %i from %s\n", icmp4->type,
-			inet_ntop(ip_type, (void*)&rcv_addr.sin_addr, pbuf, 1000));
+	/*Check packet size again*/
+	if(rlen<sizeof(struct icmphdr)+sizeof(struct iphdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
+		dbgprintf(1, "Tossing ICMPv4 packet that's too small to contain DCCP header!\n");
+		free(rcv_addr.gen);
+		return;
+	}
+
+	/*Decode IPv4 header*/
+	ip4hdr=(struct iphdr*)(rbuffer+sizeof(struct icmphdr));
+	if(memcmp(&src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(src_addr.ipv4->sin_addr))!=0){
+		/*Source address doesn't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(memcmp(&dest_addr.ipv4->sin_addr,&ip4hdr->daddr,sizeof(dest_addr.ipv4->sin_addr))!=0){
+		/*Destination address doesn't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(ip4hdr->protocol!=IPPROTO_DCCP){
+		/*Not DCCP!*/
+		free(rcv_addr.gen);
+		return;
+	}
+
+	/*Decode DCCP header*/
+	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4);
+	if(dhdr->dccph_dport!=htons(dest_port)){
+		/*DCCP Destination Ports don't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(dhdr->dccph_sport!=htons(dest_port)){
+		/*DCCP Source Ports don't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	dhdre=(struct dccp_hdr_ext*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4+sizeof(struct dccp_hdr));
+
+	/*Log*/
+	if(icmp4->type==ICMP_DEST_UNREACH){
+		type=DEST_UNREACHABLE;
+	}
+	if(icmp4->type==ICMP_TIME_EXCEEDED){
+		type=TTL_EXPIRATION;
+	}
+	logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+	free(rcv_addr.gen);
+	return;
 }
 
 void handleICMP6packet(int rcv_socket){
 	int rlen=1500;
 	unsigned char rbuffer[rlen];
-	char pbuf[1000];
-	struct sockaddr_in6 rcv_addr;
-	socklen_t rcv_addr_len=sizeof(struct sockaddr_in6);
+	ipaddr_ptr_t rcv_addr;
+	socklen_t rcv_addr_len;
 	struct icmp6_hdr *icmp6;
+	struct ip6_hdr* ip6hdr;
+	struct dccp_hdr *dhdr;
+	struct dccp_hdr_ext *dhdre;
+	int type;
+
+	/*Memory for socket address*/
+	rcv_addr_len=sizeof(struct sockaddr_storage);
+	rcv_addr.gen=malloc(rcv_addr_len);
+	if(rcv_addr.gen==NULL){
+		dbgprintf(0,"Error: Can't Allocate Memory!\n");
+		exit(1);
+	}
 
 	/*Receive Packet*/
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,(struct sockaddr*)&rcv_addr,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
 		dbgprintf(0, "Error on receive from ICMPv6 socket (%s)\n",strerror(errno));
 	}
 
 	if(rlen < sizeof(struct icmp6_hdr)){ //check packet size
 		dbgprintf(1, "Packet smaller than possible ICMPv6 packet!\n");
+		free(rcv_addr.gen);
 		return;
 	}
 
 	icmp6=(struct icmp6_hdr*)rbuffer;
-	if(icmp6->icmp6_type!=1 && icmp6->icmp6_type!=2 && icmp6->icmp6_type!=3
-			&& icmp6->icmp6_type!=4){ //check icmp types
+	if(icmp6->icmp6_type!=ICMP6_DST_UNREACH && icmp6->icmp6_type!=ICMP6_PACKET_TOO_BIG
+			&& icmp6->icmp6_type!=ICMP6_TIME_EXCEEDED && icmp6->icmp6_type!=ICMP6_PARAM_PROB){ //check icmp types
 		dbgprintf(1, "Tossing ICMPv6 packet of type %i\n", icmp6->icmp6_type);
+		free(rcv_addr.gen);
 		return;
 	}
 
-	/*Print Message*/
-	dbgprintf(0, "Got ICMPv6 type %i from %s\n", icmp6->icmp6_type,
-			inet_ntop(ip_type, (void*)&rcv_addr.sin6_addr, pbuf, 1000));
+	/*Check packet size again*/
+	if(rlen<sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
+		dbgprintf(1, "Tossing ICMPv6 packet that's too small to contain DCCP header!\n");
+		free(rcv_addr.gen);
+		return;
+	}
+
+	/*Decode IPv6 header*/
+	ip6hdr=(struct ip6_hdr*)(rbuffer+sizeof(struct icmp6_hdr));
+	if(memcmp(&src_addr.ipv6->sin6_addr,&ip6hdr->ip6_src,sizeof(src_addr.ipv6->sin6_addr))!=0){
+		/*Source address doesn't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(memcmp(&dest_addr.ipv6->sin6_addr,&ip6hdr->ip6_dst,sizeof(dest_addr.ipv6->sin6_addr))!=0){
+		/*Destination address doesn't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt!=IPPROTO_DCCP){
+		/*Not DCCP!*/
+		free(rcv_addr.gen);
+		return;
+	}
+
+	/*Decode DCCP header*/
+	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr));
+	if(dhdr->dccph_dport!=htons(dest_port)){
+		/*DCCP Destination Ports don't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	if(dhdr->dccph_sport!=htons(dest_port)){
+		/*DCCP Source Ports don't match*/
+		free(rcv_addr.gen);
+		return;
+	}
+	dhdre=(struct dccp_hdr_ext*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr)+sizeof(struct dccp_hdr));
+
+
+
+	/*Log*/
+	if(icmp6->icmp6_type==ICMP6_DST_UNREACH){
+		type=DEST_UNREACHABLE;
+	}
+	if(icmp6->icmp6_type==ICMP6_PACKET_TOO_BIG){
+		type=TOO_BIG;
+	}
+	if(icmp6->icmp6_type==ICMP6_TIME_EXCEEDED){
+		type=TTL_EXPIRATION;
+	}
+	if(icmp6->icmp6_type==ICMP6_PARAM_PROB){
+		type=PARAMETER_PROBLEM;
+	}
+	logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+	free(rcv_addr.gen);
+	return;
 }
 
-void buildRequestPacket(unsigned char* buffer, int *len){
+void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_ext *dhdre;
 	struct dccp_hdr_request *dhdrr;
@@ -505,7 +707,6 @@ void buildRequestPacket(unsigned char* buffer, int *len){
 
 	int ip_hdr_len;
 	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_request);
-	int seq=8;
 
 	if(*len < dccp_hdr_len+sizeof(struct ip6_hdr)){
 		dbgprintf(0, "Error: Insufficient buffer space\n");
@@ -574,14 +775,13 @@ void buildRequestPacket(unsigned char* buffer, int *len){
 	return;
 }
 
-void updateRequestPacket(unsigned char* buffer, int *len){
+void updateRequestPacket(unsigned char* buffer, int *len, int seq){
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_ext *dhdre;
 	struct iphdr* ip4hdr;
 
 	int ip_hdr_len;
 	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_request);
-	int tmp;
 
 	/*IP header*/
 	ip4hdr=NULL;
@@ -589,8 +789,7 @@ void updateRequestPacket(unsigned char* buffer, int *len){
 		ip_hdr_len=sizeof(struct iphdr);
 		ip4hdr=(struct iphdr*)buffer;
 		ip4hdr->check=htons(0);
-		tmp=ntohs(ip4hdr->id);
-		ip4hdr->id=htons(tmp+1);
+		ip4hdr->id=htons(seq);
 	}else{
 		ip_hdr_len=sizeof(struct ip6_hdr);
 	}
@@ -599,8 +798,7 @@ void updateRequestPacket(unsigned char* buffer, int *len){
 	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
 	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
 	dhdr->dccph_checksum=0;
-	tmp=ntohl(dhdre->dccph_seq_low);
-	dhdre->dccph_seq_low=htonl(tmp+1);
+	dhdre->dccph_seq_low=htonl(seq);
 
 	/*Checksums*/
 	if(ip_type==AF_INET){
@@ -615,6 +813,115 @@ void updateRequestPacket(unsigned char* buffer, int *len){
 	}
 	*len=ip_hdr_len+dccp_hdr_len;
 	return;
+}
+
+int logPacket(int seq){
+	struct request *tmp;
+
+	/*Add new request to queue*/
+	tmp=malloc(sizeof(struct request));
+	if(tmp==NULL){
+		dbgprintf(0,"Error: Can't allocate Memory!\n");
+		exit(1);
+	}
+	tmp->next=NULL;
+	tmp->prev=NULL;
+	tmp->num_replies=0;
+	tmp->num_errors=0;
+	tmp->seq=seq;
+	tmp->reply_type=UNKNOWN;
+	gettimeofday(&tmp->sent,NULL);
+
+	if(queue.head==NULL){
+		queue.head=queue.tail=tmp;
+		return 0;
+	}
+	queue.head->prev=tmp;
+	tmp->next=queue.head;
+	queue.head=tmp;
+
+	/*Update Statistics*/
+	if(ping_stats.requests_sent==0){
+		gettimeofday(&ping_stats.start,NULL);
+	}
+	ping_stats.requests_sent++;
+	return 0;
+}
+
+int logResponse(ipaddr_ptr_t *src, int seq, int type){
+	struct request *cur;
+	double diff;
+	char pbuf[1000];
+
+	if(queue.tail==NULL){
+		dbgprintf(1,"Response received but no requests sent!\n");
+		return -1;
+	}
+
+	/*Locate request*/
+	cur=queue.tail;
+	while(cur!=NULL){
+		if(cur->seq==seq){
+			gettimeofday(&cur->reply,NULL);
+			if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+				cur->num_replies++;
+			}else{
+				cur->num_errors++;
+			}
+			cur->reply_type=type;
+			break;
+		}
+		cur=cur->prev;
+	}
+
+	if(cur==NULL){
+		dbgprintf(1,"Response received but no requests sent with sequence number %i!\n", seq);
+		return -1;
+	}
+
+	diff=(cur->reply.tv_usec + 1000000*cur->reply.tv_sec) - (cur->sent.tv_usec + 1000000*cur->sent.tv_sec);
+	diff=diff/1000.0;
+
+	/*Print Message*/
+	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+		if(ip_type==AF_INET){
+			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
+					seq, diff,response_label[type]);
+		}else{
+			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
+					seq, diff,response_label[type]);
+		}
+	}else{
+		if(ip_type==AF_INET){
+			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
+					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
+					seq);
+		}else{
+			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
+					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
+					seq);
+		}
+	}
+
+	/*Update statistics*/
+	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+		/*Good Response*/
+		ping_stats.rtt_avg=((ping_stats.replies_received*ping_stats.rtt_avg)+(diff))/(ping_stats.replies_received+1);
+		ping_stats.replies_received++;
+		if(diff < ping_stats.rtt_min){
+			ping_stats.rtt_min=diff;
+		}
+		if(diff > ping_stats.rtt_max){
+			ping_stats.rtt_max=diff;
+		}
+	}else{
+		/*Error*/
+		cur->num_errors++;
+	}
+	gettimeofday(&ping_stats.stop,NULL);
+	return 0;
 }
 
 /*Usage information for program*/
