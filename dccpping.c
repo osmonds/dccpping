@@ -160,7 +160,7 @@ int main(int argc, char *argv[])
 			case 'i':
 				interval = (long)(atof(optarg) * 1000.0);
 				if (interval <= 0) {
-					fprintf(stderr, "Invalid interval\n");
+					dbgprintf(0, "Error: Invalid interval\n");
 					exit(1);
 				}
 				break;
@@ -170,7 +170,7 @@ int main(int argc, char *argv[])
 			case 't':
 				ttl = atoi(optarg);
 				if (ttl < 1 || ttl > 255) {
-					fprintf(stderr, "Invalid TTL\n");
+					dbgprintf(0,"Error: Invalid TTL\n");
 				}
 				break;
 			case 'S':
@@ -342,10 +342,10 @@ void doping(){
 
 	/*Start Message*/
 	if(ip_type==AF_INET){
-		dbgprintf(0, "PINGING %s on DCCP port %i\n",
+		printf("PINGING %s on DCCP port %i\n",
 				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000),dest_port);
 	}else{
-		dbgprintf(0, "PINGING %s on DCCP port %i\n",
+		printf("PINGING %s on DCCP port %i\n",
 				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000),dest_port);
 	}
 
@@ -1098,7 +1098,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 		if(cur->packet_seq==seq){
 			gettimeofday(&cur->reply,NULL);
 			if(cur->num_replies>0){
-				dbgprintf(0,"Duplicate packet detected! (%i)\n",cur->request_seq);
+				printf("Duplicate packet detected! (%i)\n",cur->request_seq);
 			}
 			if(type<DEST_UNREACHABLE && type!=UNKNOWN){
 				cur->num_replies++;
@@ -1122,21 +1122,21 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	/*Print Message*/
 	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
 		if(ip_type==AF_INET){
-			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+			printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
 					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
 					cur->request_seq, diff,response_label[type]);
 		}else{
-			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+			printf("Response from %s : seq=%i  time=%.1fms  status=%s\n",
 					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
 					cur->request_seq, diff,response_label[type]);
 		}
 	}else{
 		if(ip_type==AF_INET){
-			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
+			printf("%s from %s : seq=%i\n",response_label[type],
 					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
 					cur->request_seq);
 		}else{
-			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
+			printf("%s from %s : seq=%i\n",response_label[type],
 					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
 					cur->request_seq);
 		}
@@ -1187,20 +1187,20 @@ void sigHandler(){
 
 	/*Print Stats*/
 	if(ip_type==AF_INET){
-		dbgprintf(0,"-----------%s PING STATISTICS-----------\n",
+		printf("-----------%s PING STATISTICS-----------\n",
 				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
 	}else if(ip_type==AF_INET6){
-		dbgprintf(0,"-----------%s PING STATISTICS-----------\n",
+		printf("-----------%s PING STATISTICS-----------\n",
 				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
 	}
 	diff=(ping_stats.stop.tv_usec + 1000000*ping_stats.stop.tv_sec) -
 			(ping_stats.start.tv_usec + 1000000*ping_stats.start.tv_sec);
 	diff=diff/1000.0;
 	ploss=(1.0*(ping_stats.requests_sent-ping_stats.replies_received)/ping_stats.requests_sent*1.0)*100;
-	dbgprintf(0,"%i packets transmitted, %i received, %i errors, %.2f%% loss, time %ims\n",
+	printf("%i packets transmitted, %i received, %i errors, %.2f%% loss, time %ims\n",
 			ping_stats.requests_sent,ping_stats.replies_received,ping_stats.errors,
 			ploss,diff);
-	dbgprintf(0,"rtt min/avg/max = %.1f/%.1f/%.1f ms\n",
+	printf("rtt min/avg/max = %.1f/%.1f/%.1f ms\n",
 			ping_stats.rtt_min,ping_stats.rtt_avg,ping_stats.rtt_max);
 
 
