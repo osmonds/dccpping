@@ -30,6 +30,10 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 #include "checksums.h"
 
 
+/*Use the DCCP source port to multiplex DCCP Ping streams by PID*/
+#define SRC_PORT_AS_PID_MULTIPLEX 1
+
+
 #define MAX(x,y) (x>y ? x : y)
 extern int errno;
 
@@ -99,10 +103,11 @@ struct stats{
 };
 
 struct params{
-	int count;				/*Default number of pings (-1 is infinity)*/
-	int dest_port;			/*Default port*/
-	int ttl;				/*Default TTL*/
-	long interval;			/*Default delay between pings in ms*/
+	int count;				/*Number of pings (-1 is infinity)*/
+	int dest_port;			/*Destination port*/
+	int src_port;			/*Source port---used to encode pid*/
+	int ttl;				/*TTL*/
+	long interval;			/*Delay between pings in ms*/
 	int ip_type;			/*IPv4 or IPv6*/
 	ipaddr_ptr_t dest_addr;	/*Destination Address*/
 	ipaddr_ptr_t src_addr;	/*Source Address*/
@@ -209,6 +214,13 @@ int main(int argc, char *argv[])
 		usage();
 	}
 	dst=argv[0];
+
+#if SRC_PORT_AS_PID_MULTIPLEX
+	/*Encode PID in source port*/
+	parms.src_port=(getpid()+1024)%65535;
+#else
+	parms.src_port=parms.dest_port;
+#endif
 
 	getAddresses(src, dst);
 	if(parms.src_addr.gen==NULL || parms.dest_addr.gen==NULL){
@@ -522,7 +534,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_dport!=htons(parms.dest_port)){
+	if(dhdr->dccph_dport!=htons(parms.src_port)){
 		dbgprintf(1,"DCCP packet with wrong Destination Port\n");
 		free(rcv_addr.gen);
 		return;
@@ -656,7 +668,7 @@ void handleICMP4packet(int rcv_socket){
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_sport!=htons(parms.dest_port)){
+	if(dhdr->dccph_sport!=htons(parms.src_port)){
 		/*DCCP Source Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
@@ -750,7 +762,7 @@ void handleICMP6packet(int rcv_socket){
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_sport!=htons(parms.dest_port)){
+	if(dhdr->dccph_sport!=htons(parms.src_port)){
 		/*DCCP Source Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
@@ -830,7 +842,7 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdr->dccph_doff=dccp_hdr_len/4;
 	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(parms.dest_port);
+	dhdr->dccph_sport=htons(parms.src_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_REQUEST;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
@@ -945,7 +957,7 @@ void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dhdr->dccph_doff=dccp_hdr_len/4;
 	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(parms.dest_port);
+	dhdr->dccph_sport=htons(parms.src_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_CLOSE;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
@@ -1033,7 +1045,7 @@ void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dhdr->dccph_doff=dccp_hdr_len/4;
 	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(parms.dest_port);
+	dhdr->dccph_sport=htons(parms.src_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_RESET;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
