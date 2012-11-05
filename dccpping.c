@@ -63,7 +63,8 @@ char* response_label[]= {
 
 
 struct request{
-	int				seq;
+	int				request_seq;
+	int				packet_seq;
 	int				num_replies;
 	int				num_errors;
 	struct timeval	sent;
@@ -112,7 +113,7 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq);
 void updateRequestPacket(unsigned char* buffer, int *len, int seq);
 void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
 void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
-int logPacket(int seq);
+int logPacket(int req_seq, int packet_seq);
 int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void clearQueue();
 void sigHandler();
@@ -304,7 +305,8 @@ void doping(){
 	struct timeval timeout;
 	struct timeval t,delay, add;
 	char pbuf[1000];
-	int seq=1;
+	int request_seq=1;
+	int packet_seq;
 
 	/*Open Sockets*/
 	rs=socket(ip_type, SOCK_RAW ,IPPROTO_RAW);
@@ -330,7 +332,8 @@ void doping(){
 
 
 	/*Build DCCP packet*/
-	buildRequestPacket(sbuffer,&slen,seq);
+	packet_seq=rand();
+	buildRequestPacket(sbuffer,&slen,packet_seq);
 	if(ip_type==AF_INET){
 		addrlen=sizeof(struct sockaddr_in);
 	}else{
@@ -355,7 +358,7 @@ void doping(){
 		}
 		if(count==0){done=1; break;}
 
-		if (logPacket(seq)<0){
+		if (logPacket(request_seq,packet_seq)<0){
 			dbgprintf(0,"Error: Couldn't record request!\n");
 		}
 		if(ip_type==AF_INET){
@@ -405,8 +408,9 @@ void doping(){
 		if(count>-1){
 			count--;
 		}
-		seq++;
-		updateRequestPacket(sbuffer,&slen, seq);
+		request_seq++;
+		packet_seq=rand();
+		updateRequestPacket(sbuffer,&slen, packet_seq);
 	}
 
 	close(rs);
@@ -502,7 +506,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	/*Pick Response*/
 	if(dhdr->dccph_type==DCCP_PKT_RESET){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_reset)){
-			dbgprintf(1, "Error: Reset packet too small!");
+			dbgprintf(1, "Tossing DCCP Reset packet that's small!\n");
 			return;
 		}
 		dhdr_re=(struct dccp_hdr_reset*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
@@ -517,7 +521,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	}
 	if(dhdr->dccph_type==DCCP_PKT_RESPONSE){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_response)){
-			dbgprintf(1, "Error: Response packet too small!");
+			dbgprintf(1, "Tossing DCCP Response packet that's too small!\n");
 			return;
 		}
 
@@ -532,7 +536,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	}
 	if(dhdr->dccph_type==DCCP_PKT_SYNC || dhdr->dccph_type==DCCP_PKT_SYNCACK){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits)){
-			dbgprintf(1, "Error: Response packet too small!");
+			dbgprintf(1, "Tossing DCCP Sync/SyncAck packet that's too small!\n");
 			return;
 		}
 
@@ -1044,7 +1048,7 @@ void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	return;
 }
 
-int logPacket(int seq){
+int logPacket(int req_seq, int packet_seq){
 	struct request *tmp;
 
 	/*Add new request to queue*/
@@ -1057,7 +1061,8 @@ int logPacket(int seq){
 	tmp->prev=NULL;
 	tmp->num_replies=0;
 	tmp->num_errors=0;
-	tmp->seq=seq;
+	tmp->packet_seq=packet_seq;
+	tmp->request_seq=req_seq;
 	tmp->reply_type=UNKNOWN;
 	gettimeofday(&tmp->sent,NULL);
 
@@ -1090,10 +1095,10 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	/*Locate request*/
 	cur=queue.tail;
 	while(cur!=NULL){
-		if(cur->seq==seq){
+		if(cur->packet_seq==seq){
 			gettimeofday(&cur->reply,NULL);
 			if(cur->num_replies>0){
-				dbgprintf(0,"Duplicate packet detected! (%i)\n", seq);
+				dbgprintf(0,"Duplicate packet detected! (%i)\n",cur->request_seq);
 			}
 			if(type<DEST_UNREACHABLE && type!=UNKNOWN){
 				cur->num_replies++;
@@ -1119,21 +1124,21 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 		if(ip_type==AF_INET){
 			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
 					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
-					seq, diff,response_label[type]);
+					cur->request_seq, diff,response_label[type]);
 		}else{
 			dbgprintf(0, "Response from %s : seq=%i  time=%.1fms  status=%s\n",
 					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
-					seq, diff,response_label[type]);
+					cur->request_seq, diff,response_label[type]);
 		}
 	}else{
 		if(ip_type==AF_INET){
 			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
 					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
-					seq);
+					cur->request_seq);
 		}else{
 			dbgprintf(0, "%s from %s : seq=%i\n",response_label[type],
 					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
-					seq);
+					cur->request_seq);
 		}
 	}
 
