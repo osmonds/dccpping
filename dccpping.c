@@ -31,6 +31,9 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 
 
 #define MAX(x,y) (x>y ? x : y)
+extern int errno;
+
+
 /*Structure for simpler IPv4/IPv6 Address handling*/
 typedef union ipaddr{
 	struct sockaddr *gen;
@@ -38,6 +41,7 @@ typedef union ipaddr{
 	struct sockaddr_in6 *ipv6;
 } ipaddr_ptr_t;
 
+/*Possible Responses to a Request*/
 enum responses{
 	UNKNOWN=0,
 	RESET,
@@ -49,7 +53,9 @@ enum responses{
 	PARAMETER_PROBLEM,
 	DCCP_ERROR
 };
-char* response_label[]= {
+
+/*Output strings corresponding to enum responses*/
+static const char* response_label[]= {
 "Unknown",
 "Closed Port (Reset)",
 "Open Port (Response)",
@@ -61,7 +67,7 @@ char* response_label[]= {
 "Protocol Error (DCCP Reset)"
 };
 
-
+/*Structure to keep track of information about a request*/
 struct request{
 	int				request_seq;
 	int				packet_seq;
@@ -74,6 +80,13 @@ struct request{
 	struct request  *prev;
 };
 
+/*Request Queue head structure*/
+struct request_queue{
+	struct request *head;
+	struct request *tail;
+};
+
+/*Statistics about the requests and replies sent*/
 struct stats{
 	int				requests_sent;
 	int				replies_received;
@@ -85,23 +98,21 @@ struct stats{
 	struct timeval 	stop;
 };
 
-struct request_queue{
-	struct request *head;
-	struct request *tail;
+struct params{
+	int count;				/*Default number of pings (-1 is infinity)*/
+	int dest_port;			/*Default port*/
+	int ttl;				/*Default TTL*/
+	long interval;			/*Default delay between pings in ms*/
+	int ip_type;			/*IPv4 or IPv6*/
+	ipaddr_ptr_t dest_addr;	/*Destination Address*/
+	ipaddr_ptr_t src_addr;	/*Source Address*/
 };
 
 
-int debug=0;			/*set to 1 to turn on debugging information*/
-int count=-1;			/*Default number of pings (-1 is infinity)*/
-int dest_port=33434;	/*Default port*/
-int ttl=64;				/*Default TTL*/
-long interval=1000;		/*Default delay between pings in ms*/
-int ip_type=AF_UNSPEC;	/*IPv4 or IPv6*/
-ipaddr_ptr_t dest_addr;	/*Destination Address*/
-ipaddr_ptr_t src_addr;	/*Source Address*/
-struct request_queue 	queue;
-struct stats			ping_stats;
-extern int errno;
+int 					debug=0;		/*set to 1 to turn on debugging information*/
+struct request_queue 	queue;			/*Queue of requests to track RTT/duplicate information*/
+struct stats			ping_stats;		/*Ping Statistics*/
+struct params			parms;			/*Parameters for ping*/
 
 
 void getAddresses(char *src, char* dst);
@@ -128,6 +139,8 @@ int main(int argc, char *argv[])
 	char c;
 	char *src=NULL;
 	char *dst=NULL;
+
+	/*Set Defaults*/
 	queue.head=NULL;
 	queue.tail=NULL;
 	ping_stats.replies_received=0;
@@ -136,30 +149,37 @@ int main(int argc, char *argv[])
 	ping_stats.rtt_max=0;
 	ping_stats.rtt_min=0;
 	ping_stats.errors=0;
+	parms.count=-1;
+	parms.dest_port=33434;
+	parms.ttl=64;
+	parms. interval=1000;
+	parms.ip_type=AF_UNSPEC;
+	parms.dest_addr.gen=NULL;
+	parms.src_addr.gen=NULL;
 
 	sanitize_environment();
 
 	while ((c = getopt(argc, argv, "64c:p:i:dt:S:")) != -1) {
 		switch (c) {
 			case '6':
-				ip_type=AF_INET6;
+				parms.ip_type=AF_INET6;
 				break;
 			case '4':
-				ip_type=AF_INET;
+				parms.ip_type=AF_INET;
 				break;
 			case 'c':
-				count = atoi(optarg);
-				if(count<=0){
+				parms.count = atoi(optarg);
+				if(parms.count<=0){
 					dbgprintf(0, "Error: count must be positive");
 					exit(1);
 				}
 				break;
 			case 'p':
-				dest_port = atoi(optarg);
+				parms.dest_port = atoi(optarg);
 				break;
 			case 'i':
-				interval = (long)(atof(optarg) * 1000.0);
-				if (interval <= 0) {
+				parms.interval = (long)(atof(optarg) * 1000.0);
+				if (parms.interval <= 0) {
 					dbgprintf(0, "Error: Invalid interval\n");
 					exit(1);
 				}
@@ -168,8 +188,8 @@ int main(int argc, char *argv[])
 				debug++;
 				break;
 			case 't':
-				ttl = atoi(optarg);
-				if (ttl < 1 || ttl > 255) {
+				parms.ttl = atoi(optarg);
+				if (parms.ttl < 1 || parms.ttl > 255) {
 					dbgprintf(0,"Error: Invalid TTL\n");
 				}
 				break;
@@ -191,7 +211,7 @@ int main(int argc, char *argv[])
 	dst=argv[0];
 
 	getAddresses(src, dst);
-	if(src_addr.gen==NULL || dest_addr.gen==NULL){
+	if(parms.src_addr.gen==NULL || parms.dest_addr.gen==NULL){
 		dbgprintf(0,"Error: Can't determine source or destination address\n");
 		exit(1);
 	}
@@ -199,8 +219,8 @@ int main(int argc, char *argv[])
 	signal(SIGINT, sigHandler);
 	doping();
 
-	free(src_addr.gen);
-	free(dest_addr.gen);
+	free(parms.src_addr.gen);
+	free(parms.dest_addr.gen);
 	clearQueue();
 	return 0;
 }
@@ -215,7 +235,7 @@ void getAddresses(char *src, char* dst){
 
 	/*Lookup destination Address*/
 	memset(&hint,0,sizeof(struct addrinfo));
-	hint.ai_family=ip_type;
+	hint.ai_family=parms.ip_type;
 	hint.ai_flags=AI_V4MAPPED | AI_ADDRCONFIG;
 
 	if((err=getaddrinfo(dst,NULL,&hint,&dtmp))!=0){
@@ -227,13 +247,13 @@ void getAddresses(char *src, char* dst){
 		exit(1);
 	}else{
 		addrlen=dtmp->ai_addrlen;
-		hint.ai_family=ip_type=dtmp->ai_family;
-		dest_addr.gen=malloc(dtmp->ai_addrlen);
-		if(dest_addr.gen==NULL){
+		hint.ai_family=parms.ip_type=dtmp->ai_family;
+		parms.dest_addr.gen=malloc(dtmp->ai_addrlen);
+		if(parms.dest_addr.gen==NULL){
 			dbgprintf(0,"Error: Can't allocate Memory\n");
 			exit(1);
 		}
-		memcpy(dest_addr.gen,dtmp->ai_addr,dtmp->ai_addrlen);
+		memcpy(parms.dest_addr.gen,dtmp->ai_addr,dtmp->ai_addrlen);
 	}
 	freeaddrinfo(dtmp);
 
@@ -249,12 +269,12 @@ void getAddresses(char *src, char* dst){
 			exit(1);
 		}else{
 			addrlen=stmp->ai_addrlen;
-			src_addr.gen=malloc(stmp->ai_addrlen);
-			if(src_addr.gen==NULL){
+			parms.src_addr.gen=malloc(stmp->ai_addrlen);
+			if(parms.src_addr.gen==NULL){
 				dbgprintf(0,"Error: Can't allocate Memory\n");
 				exit(1);
 			}
-			memcpy(src_addr.gen,stmp->ai_addr,stmp->ai_addrlen);
+			memcpy(parms.src_addr.gen,stmp->ai_addr,stmp->ai_addrlen);
 		}
 		freeaddrinfo(stmp);
 	}else{
@@ -262,7 +282,8 @@ void getAddresses(char *src, char* dst){
 		getifaddrs(&temp);
 		cur=temp;
 		while(cur!=NULL){
-			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=ip_type){ /*Not matching ipv4/ipv6 of dest*/
+			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=parms.ip_type){
+				/*Not matching ipv4/ipv6 of dest*/
 				cur=cur->ifa_next;
 				continue;
 			}
@@ -279,13 +300,13 @@ void getAddresses(char *src, char* dst){
 				}
 			}
 
-			src_addr.gen=malloc(sizeof(struct sockaddr_storage));
-			if(src_addr.gen==NULL){
+			parms.src_addr.gen=malloc(sizeof(struct sockaddr_storage));
+			if(parms.src_addr.gen==NULL){
 				dbgprintf(0,"Error: Can't allocate Memory\n");
 				exit(1);
 			}
-			src_addr.gen->sa_family=ip_type;
-			memcpy(src_addr.gen,cur->ifa_addr,addrlen);
+			parms.src_addr.gen->sa_family=parms.ip_type;
+			memcpy(parms.src_addr.gen,cur->ifa_addr,addrlen);
 			//break;
 			cur=cur->ifa_next;
 		}
@@ -309,22 +330,22 @@ void doping(){
 	int packet_seq;
 
 	/*Open Sockets*/
-	rs=socket(ip_type, SOCK_RAW ,IPPROTO_RAW);
+	rs=socket(parms.ip_type, SOCK_RAW ,IPPROTO_RAW);
 	if(rs<0){
 		dbgprintf(0, "Error opening raw socket\n");
 		exit(1);
 	}
-	ds=socket(ip_type, SOCK_RAW ,IPPROTO_DCCP);
+	ds=socket(parms.ip_type, SOCK_RAW ,IPPROTO_DCCP);
 	if(ds<0){
 		dbgprintf(0, "Error opening raw DCCP socket\n");
 		exit(1);
 	}
-	is4=socket(ip_type,SOCK_RAW,IPPROTO_ICMP);
+	is4=socket(parms.ip_type,SOCK_RAW,IPPROTO_ICMP);
 	if(is4<0){
 		dbgprintf(0,"Error opening raw ICMPv4 socket\n");
 		exit(1);
 	}
-	is6=socket(ip_type,SOCK_RAW,IPPROTO_ICMPV6);
+	is6=socket(parms.ip_type,SOCK_RAW,IPPROTO_ICMPV6);
 	if(is6<0){
 		dbgprintf(0,"Error opening raw ICMPv6 socket\n");
 		exit(1);
@@ -334,42 +355,46 @@ void doping(){
 	/*Build DCCP packet*/
 	packet_seq=rand();
 	buildRequestPacket(sbuffer,&slen,packet_seq);
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		addrlen=sizeof(struct sockaddr_in);
 	}else{
 		addrlen=sizeof(struct sockaddr_in6);
 	}
 
 	/*Start Message*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		printf("PINGING %s on DCCP port %i\n",
-				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000),dest_port);
+				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000),
+				parms.dest_port);
 	}else{
 		printf("PINGING %s on DCCP port %i\n",
-				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000),dest_port);
+				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000),
+				parms.dest_port);
 	}
 
 	while(!done){
 		/*Send Ping*/
-		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
+		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
 			if(errno!=EINTR){
 				dbgprintf(0,"Error: sendto failed\n");
 			}
 		}
-		if(count==0){done=1; break;}
+		if(parms.count==0){done=1; break;}
 
 		if (logPacket(request_seq,packet_seq)<0){
 			dbgprintf(0,"Error: Couldn't record request!\n");
 		}
-		if(ip_type==AF_INET){
-			dbgprintf(1, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
+		if(parms.ip_type==AF_INET){
+			dbgprintf(1, "Sending DCCP Request to %s\n",
+					inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000));
 		}else{
-			dbgprintf(1, "Sending DCCP Request to %s\n",inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
+			dbgprintf(1, "Sending DCCP Request to %s\n",
+					inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000));
 		}
 
 		/*Use select to wait on packets or until interval has passed*/
-		add.tv_sec=interval/1000;
-		add.tv_usec=(interval%1000)*1000;
+		add.tv_sec=parms.interval/1000;
+		add.tv_usec=(parms.interval%1000)*1000;
 		gettimeofday(&t,NULL);
 		timeradd(&t,&add,&delay);
 		while(timercmp(&t,&delay,<)){
@@ -386,18 +411,18 @@ void doping(){
 					dbgprintf(0,"Select() error (%s)\n",strerror(errno));
 				}
 			}
-			if(count==0){done=1;break;}
+			if(parms.count==0){done=1;break;}
 
 			if(FD_ISSET(ds,&sel)){
 				/*Data on the DCCP socket*/
 				handleDCCPpacket(ds,rs);
 
 			}
-			if(FD_ISSET(is4,&sel) && ip_type==AF_INET){
+			if(FD_ISSET(is4,&sel) && parms.ip_type==AF_INET){
 				/*Data on the ICMPv4 socket*/
 				handleICMP4packet(is4);
 			}
-			if(FD_ISSET(is6,&sel) && ip_type==AF_INET6){
+			if(FD_ISSET(is6,&sel) && parms.ip_type==AF_INET6){
 				/*Data on the ICMPv6 socket*/
 				handleICMP6packet(is6);
 			}
@@ -405,8 +430,8 @@ void doping(){
 		}
 
 		/*Update count*/
-		if(count>-1){
-			count--;
+		if(parms.count>-1){
+			parms.count--;
 		}
 		request_seq++;
 		packet_seq=rand();
@@ -451,16 +476,16 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		return;
 	}
 
-	if(rcv_addr.gen->sa_family!=ip_type){ //confirm IP type
-		dbgprintf(1, "DCCP packet on %s. Tossing.\n", (ip_type==AF_INET) ? "IPv4" : "IPv6");
+	if(rcv_addr.gen->sa_family!=parms.ip_type){ //confirm IP type
+		dbgprintf(1, "DCCP packet on %s. Tossing.\n", (parms.ip_type==AF_INET) ? "IPv4" : "IPv6");
 		free(rcv_addr.gen);
 		return;
 	}
 
 	if(rcv_addr.gen->sa_family==AF_INET){
 		/*IPv4*/
-		if(memcmp(&rcv_addr.ipv4->sin_addr,&dest_addr.ipv4->sin_addr,
-				sizeof(dest_addr.ipv4->sin_addr))!=0){ //not from destination
+		if(memcmp(&rcv_addr.ipv4->sin_addr,&parms.dest_addr.ipv4->sin_addr,
+				sizeof(parms.dest_addr.ipv4->sin_addr))!=0){ //not from destination
 			dbgprintf(1,"DCCP packet from 3rd host\n");
 			free(rcv_addr.gen);
 			return;
@@ -475,8 +500,8 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		ptr=rbuffer+iph->ihl*4;
 	}else{
 		/*IPv6*/
-		if(memcmp(&rcv_addr.ipv6->sin6_addr, &dest_addr.ipv6->sin6_addr,
-				sizeof(dest_addr.ipv6->sin6_addr))!=0){ //not from destination
+		if(memcmp(&rcv_addr.ipv6->sin6_addr, &parms.dest_addr.ipv6->sin6_addr,
+				sizeof(parms.dest_addr.ipv6->sin6_addr))!=0){ //not from destination
 			dbgprintf(1,"DCCP packet from 3rd host\n");
 			free(rcv_addr.gen);
 			return;
@@ -492,12 +517,12 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 
 	/*DCCP checks*/
 	dhdr=(struct dccp_hdr*)ptr;
-	if(dhdr->dccph_sport!=htons(dest_port)){
+	if(dhdr->dccph_sport!=htons(parms.dest_port)){
 		dbgprintf(1,"DCCP packet with wrong Source Port (%i)\n", ntohs(dhdr->dccph_sport));
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_dport!=htons(dest_port)){
+	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		dbgprintf(1,"DCCP packet with wrong Destination Port\n");
 		free(rcv_addr.gen);
 		return;
@@ -604,13 +629,13 @@ void handleICMP4packet(int rcv_socket){
 
 	/*Decode IPv4 header*/
 	ip4hdr=(struct iphdr*)(rbuffer+sizeof(struct icmphdr));
-	if(memcmp(&src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(src_addr.ipv4->sin_addr))!=0){
+	if(memcmp(&parms.src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(parms.src_addr.ipv4->sin_addr))!=0){
 		/*Source address doesn't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 source address isn't us\n");
 		free(rcv_addr.gen);
 		return;
 	}
-	if(memcmp(&dest_addr.ipv4->sin_addr,&ip4hdr->daddr,sizeof(dest_addr.ipv4->sin_addr))!=0){
+	if(memcmp(&parms.dest_addr.ipv4->sin_addr,&ip4hdr->daddr,sizeof(parms.dest_addr.ipv4->sin_addr))!=0){
 		/*Destination address doesn't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 destination address isn't our target\n");
 		free(rcv_addr.gen);
@@ -625,13 +650,13 @@ void handleICMP4packet(int rcv_socket){
 
 	/*Decode DCCP header*/
 	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4);
-	if(dhdr->dccph_dport!=htons(dest_port)){
+	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		/*DCCP Destination Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_sport!=htons(dest_port)){
+	if(dhdr->dccph_sport!=htons(parms.dest_port)){
 		/*DCCP Source Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
@@ -698,13 +723,13 @@ void handleICMP6packet(int rcv_socket){
 
 	/*Decode IPv6 header*/
 	ip6hdr=(struct ip6_hdr*)(rbuffer+sizeof(struct icmp6_hdr));
-	if(memcmp(&src_addr.ipv6->sin6_addr,&ip6hdr->ip6_src,sizeof(src_addr.ipv6->sin6_addr))!=0){
+	if(memcmp(&parms.src_addr.ipv6->sin6_addr,&ip6hdr->ip6_src,sizeof(parms.src_addr.ipv6->sin6_addr))!=0){
 		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 source address isn't us\n");
 		/*Source address doesn't match*/
 		free(rcv_addr.gen);
 		return;
 	}
-	if(memcmp(&dest_addr.ipv6->sin6_addr,&ip6hdr->ip6_dst,sizeof(dest_addr.ipv6->sin6_addr))!=0){
+	if(memcmp(&parms.dest_addr.ipv6->sin6_addr,&ip6hdr->ip6_dst,sizeof(parms.dest_addr.ipv6->sin6_addr))!=0){
 		/*Destination address doesn't match*/
 		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 destination address isn't our target\n");
 		free(rcv_addr.gen);
@@ -719,13 +744,13 @@ void handleICMP6packet(int rcv_socket){
 
 	/*Decode DCCP header*/
 	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr));
-	if(dhdr->dccph_dport!=htons(dest_port)){
+	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		/*DCCP Destination Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
-	if(dhdr->dccph_sport!=htons(dest_port)){
+	if(dhdr->dccph_sport!=htons(parms.dest_port)){
 		/*DCCP Source Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
@@ -770,27 +795,27 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 
 	/*IP header*/
 	ip4hdr=NULL;
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		ip_hdr_len=sizeof(struct iphdr);
 		ip4hdr=(struct iphdr*)buffer;
 		ip4hdr->check=htons(0);
-		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->daddr, &parms.dest_addr.ipv4->sin_addr, sizeof(parms.dest_addr.ipv4->sin_addr));
 		ip4hdr->frag_off=htons(0);
 		ip4hdr->id=htons(1);//first
 		ip4hdr->ihl=5;
 		ip4hdr->protocol=IPPROTO_DCCP;
-		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->saddr, &parms.src_addr.ipv4->sin_addr, sizeof(parms.src_addr.ipv4->sin_addr));
 		ip4hdr->tos=0;
 		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
-		ip4hdr->ttl=ttl;
+		ip4hdr->ttl=parms.ttl;
 		ip4hdr->version=4;
 	}else{
 		ip_hdr_len=sizeof(struct ip6_hdr);
 		ip6hdr=(struct ip6_hdr*)buffer;
-		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
-		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_dst, &parms.dest_addr.ipv6->sin6_addr, sizeof(parms.dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &parms.src_addr.ipv6->sin6_addr, sizeof(parms.src_addr.ipv6->sin6_addr));
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=parms.ttl;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
 	}
@@ -803,9 +828,9 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdr->dccph_checksum=0;
 	dhdr->dccph_cscov=0;
 	dhdr->dccph_doff=dccp_hdr_len/4;
-	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_sport=htons(parms.dest_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_REQUEST;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
@@ -814,15 +839,15 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdrr->dccph_req_service= htonl(0x50455246);
 
 	/*Checksums*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv4->sin_addr,
-				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
+				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
 		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
 	}else{
 		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	*len=ip_hdr_len+dccp_hdr_len;
 	return;
@@ -838,7 +863,7 @@ void updateRequestPacket(unsigned char* buffer, int *len, int seq){
 
 	/*IP header*/
 	ip4hdr=NULL;
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		ip_hdr_len=sizeof(struct iphdr);
 		ip4hdr=(struct iphdr*)buffer;
 		ip4hdr->check=htons(0);
@@ -854,15 +879,15 @@ void updateRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdre->dccph_seq_low=htonl(seq);
 
 	/*Checksums*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv4->sin_addr,
-				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
+				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
 		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
 	}else{
 		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	*len=ip_hdr_len+dccp_hdr_len;
 	return;
@@ -885,27 +910,27 @@ void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 
 	/*IP header*/
 	ip4hdr=NULL;
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		ip_hdr_len=sizeof(struct iphdr);
 		ip4hdr=(struct iphdr*)buffer;
 		ip4hdr->check=htons(0);
-		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->daddr, &parms.dest_addr.ipv4->sin_addr, sizeof(parms.dest_addr.ipv4->sin_addr));
 		ip4hdr->frag_off=htons(0);
 		ip4hdr->id=htons(1);//first
 		ip4hdr->ihl=5;
 		ip4hdr->protocol=IPPROTO_DCCP;
-		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->saddr, &parms.src_addr.ipv4->sin_addr, sizeof(parms.src_addr.ipv4->sin_addr));
 		ip4hdr->tos=0;
 		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
-		ip4hdr->ttl=ttl;
+		ip4hdr->ttl=parms.ttl;
 		ip4hdr->version=4;
 	}else{
 		ip_hdr_len=sizeof(struct ip6_hdr);
 		ip6hdr=(struct ip6_hdr*)buffer;
-		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
-		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_dst, &parms.dest_addr.ipv6->sin6_addr, sizeof(parms.dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &parms.src_addr.ipv6->sin6_addr, sizeof(parms.src_addr.ipv6->sin6_addr));
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=parms.ttl;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
 	}
@@ -918,9 +943,9 @@ void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dhdr->dccph_checksum=0;
 	dhdr->dccph_cscov=0;
 	dhdr->dccph_doff=dccp_hdr_len/4;
-	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_sport=htons(parms.dest_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_CLOSE;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
@@ -930,25 +955,25 @@ void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dhd_ack->dccph_ack_nr_low=ack_l;
 
 	/*Checksums*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv4->sin_addr,
-				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
+				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
 		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
 	}else{
 		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	len=ip_hdr_len+dccp_hdr_len;
 
 	/*Send*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		addrlen=sizeof(struct sockaddr_in);
 	}else{
 		addrlen=sizeof(struct sockaddr_in6);
 	}
-	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
+	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
 		if(errno!=EINTR){
 			dbgprintf(0,"Error: sendto failed\n");
 		}
@@ -973,27 +998,27 @@ void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 
 	/*IP header*/
 	ip4hdr=NULL;
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		ip_hdr_len=sizeof(struct iphdr);
 		ip4hdr=(struct iphdr*)buffer;
 		ip4hdr->check=htons(0);
-		memcpy(&ip4hdr->daddr, &dest_addr.ipv4->sin_addr, sizeof(dest_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->daddr, &parms.dest_addr.ipv4->sin_addr, sizeof(parms.dest_addr.ipv4->sin_addr));
 		ip4hdr->frag_off=htons(0);
 		ip4hdr->id=htons(1);//first
 		ip4hdr->ihl=5;
 		ip4hdr->protocol=IPPROTO_DCCP;
-		memcpy(&ip4hdr->saddr, &src_addr.ipv4->sin_addr, sizeof(src_addr.ipv4->sin_addr));
+		memcpy(&ip4hdr->saddr, &parms.src_addr.ipv4->sin_addr, sizeof(parms.src_addr.ipv4->sin_addr));
 		ip4hdr->tos=0;
 		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
-		ip4hdr->ttl=ttl;
+		ip4hdr->ttl=parms.ttl;
 		ip4hdr->version=4;
 	}else{
 		ip_hdr_len=sizeof(struct ip6_hdr);
 		ip6hdr=(struct ip6_hdr*)buffer;
-		memcpy(&ip6hdr->ip6_dst, &dest_addr.ipv6->sin6_addr, sizeof(dest_addr.ipv6->sin6_addr));
-		memcpy(&ip6hdr->ip6_src, &src_addr.ipv6->sin6_addr, sizeof(src_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_dst, &parms.dest_addr.ipv6->sin6_addr, sizeof(parms.dest_addr.ipv6->sin6_addr));
+		memcpy(&ip6hdr->ip6_src, &parms.src_addr.ipv6->sin6_addr, sizeof(parms.src_addr.ipv6->sin6_addr));
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=ttl;
+		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=parms.ttl;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
 		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
 	}
@@ -1006,9 +1031,9 @@ void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dhdr->dccph_checksum=0;
 	dhdr->dccph_cscov=0;
 	dhdr->dccph_doff=dccp_hdr_len/4;
-	dhdr->dccph_dport=htons(dest_port);
+	dhdr->dccph_dport=htons(parms.dest_port);
 	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(dest_port);
+	dhdr->dccph_sport=htons(parms.dest_port);
 	dhdr->dccph_x=1;
 	dhdr->dccph_type=DCCP_PKT_RESET;
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
@@ -1022,25 +1047,25 @@ void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
 	dh_re->dccph_reset_data[2]=0;
 
 	/*Checksums*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv4->sin_addr,
-				(unsigned char*)&src_addr.ipv4->sin_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
+				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
 		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
 	}else{
 		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
+				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
+				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	len=ip_hdr_len+dccp_hdr_len;
 
 	/*Send*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		addrlen=sizeof(struct sockaddr_in);
 	}else{
 		addrlen=sizeof(struct sockaddr_in6);
 	}
-	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)dest_addr.gen,addrlen)<0){
+	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
 		if(errno!=EINTR){
 			dbgprintf(0,"Error: sendto failed\n");
 		}
@@ -1121,23 +1146,23 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 
 	/*Print Message*/
 	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
-		if(ip_type==AF_INET){
+		if(parms.ip_type==AF_INET){
 			printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
+					inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
 					cur->request_seq, diff,response_label[type]);
 		}else{
 			printf("Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
+					inet_ntop(parms.ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
 					cur->request_seq, diff,response_label[type]);
 		}
 	}else{
-		if(ip_type==AF_INET){
+		if(parms.ip_type==AF_INET){
 			printf("%s from %s : seq=%i\n",response_label[type],
-					inet_ntop(ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
+					inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
 					cur->request_seq);
 		}else{
 			printf("%s from %s : seq=%i\n",response_label[type],
-					inet_ntop(ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
+					inet_ntop(parms.ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
 					cur->request_seq);
 		}
 	}
@@ -1186,12 +1211,12 @@ void sigHandler(){
 	double ploss;
 
 	/*Print Stats*/
-	if(ip_type==AF_INET){
+	if(parms.ip_type==AF_INET){
 		printf("-----------%s PING STATISTICS-----------\n",
-				inet_ntop(ip_type, (void*)&dest_addr.ipv4->sin_addr, pbuf, 1000));
-	}else if(ip_type==AF_INET6){
+				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000));
+	}else if(parms.ip_type==AF_INET6){
 		printf("-----------%s PING STATISTICS-----------\n",
-				inet_ntop(ip_type, (void*)&dest_addr.ipv6->sin6_addr, pbuf, 1000));
+				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000));
 	}
 	diff=(ping_stats.stop.tv_usec + 1000000*ping_stats.stop.tv_sec) -
 			(ping_stats.start.tv_usec + 1000000*ping_stats.start.tv_sec);
@@ -1205,7 +1230,7 @@ void sigHandler(){
 
 
 	/*Exit Quickly*/
-	count=0;
+	parms.count=0;
 }
 
 /*Usage information for program*/
