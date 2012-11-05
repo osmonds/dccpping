@@ -479,7 +479,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 
 	/*Receive Packet*/
 	rcv_addr_len=sizeof(struct sockaddr_storage);
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1500,0,rcv_addr.gen,&rcv_addr_len))<0){
 		if(errno!=EINTR){
 			dbgprintf(0, "Error on receive from DCCP socket (%s)\n",strerror(errno));
 		}
@@ -599,6 +599,7 @@ void handleICMP4packet(int rcv_socket){
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_ext *dhdre;
 	struct iphdr* ip4hdr;
+	struct iphdr* iph;
 	int type;
 
 	/*Memory for socket address*/
@@ -610,7 +611,7 @@ void handleICMP4packet(int rcv_socket){
 	}
 
 	/*Receive Packet*/
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1500,0,rcv_addr.gen,&rcv_addr_len))<0){
 		if(errno!=EINTR){
 			dbgprintf(0, "Error on receive from ICMPv4 socket (%s)\n",strerror(errno));
 		}
@@ -619,13 +620,16 @@ void handleICMP4packet(int rcv_socket){
 		return;
 	}
 
-	if(rlen < sizeof(struct icmphdr)){ //check packet size
+	iph=(struct iphdr*)rbuffer;
+
+
+	if(rlen < sizeof(struct icmphdr)+sizeof(struct iphdr)){ //check packet size
 		dbgprintf(1, "Packet smaller than possible ICMPv4 packet!\n");
 		free(rcv_addr.gen);
 		return;
 	}
 
-	icmp4=(struct icmphdr*)rbuffer;
+	icmp4=(struct icmphdr*)(rbuffer+iph->ihl*4);
 	if(icmp4->type!=ICMP_DEST_UNREACH && icmp4->type!=ICMP_TIME_EXCEEDED){ //check icmp types
 		dbgprintf(1, "Tossing ICMPv4 packet of type %i\n", icmp4->type);
 		free(rcv_addr.gen);
@@ -633,14 +637,14 @@ void handleICMP4packet(int rcv_socket){
 	}
 
 	/*Check packet size again*/
-	if(rlen<sizeof(struct icmphdr)+sizeof(struct iphdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
+	if(rlen<sizeof(struct icmphdr)+2*sizeof(struct iphdr)+4){
 		dbgprintf(1, "Tossing ICMPv4 packet that's too small to contain DCCP header!\n");
 		free(rcv_addr.gen);
 		return;
 	}
 
 	/*Decode IPv4 header*/
-	ip4hdr=(struct iphdr*)(rbuffer+sizeof(struct icmphdr));
+	ip4hdr=(struct iphdr*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr));
 	if(memcmp(&parms.src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(parms.src_addr.ipv4->sin_addr))!=0){
 		/*Source address doesn't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 source address isn't us\n");
@@ -661,7 +665,7 @@ void handleICMP4packet(int rcv_socket){
 	}
 
 	/*Decode DCCP header*/
-	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4);
+	dhdr=(struct dccp_hdr*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr)+ip4hdr->ihl*4);
 	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		/*DCCP Destination Ports don't match*/
 		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP destination port\n");
@@ -674,7 +678,7 @@ void handleICMP4packet(int rcv_socket){
 		free(rcv_addr.gen);
 		return;
 	}
-	dhdre=(struct dccp_hdr_ext*)(rbuffer+sizeof(struct icmphdr)+ip4hdr->ihl*4+sizeof(struct dccp_hdr));
+	dhdre=(struct dccp_hdr_ext*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr)+ip4hdr->ihl*4+sizeof(struct dccp_hdr));
 
 	/*Log*/
 	if(icmp4->type==ICMP_DEST_UNREACH){
@@ -683,7 +687,11 @@ void handleICMP4packet(int rcv_socket){
 	if(icmp4->type==ICMP_TIME_EXCEEDED){
 		type=TTL_EXPIRATION;
 	}
-	logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+	if(rlen<sizeof(struct icmphdr)+2*sizeof(struct iphdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
+		logResponse(&rcv_addr,-1,type);
+	}else{
+		logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+	}
 	free(rcv_addr.gen);
 	return;
 }
@@ -708,7 +716,7 @@ void handleICMP6packet(int rcv_socket){
 	}
 
 	/*Receive Packet*/
-	if((rlen=recvfrom(rcv_socket, &rbuffer, 1000,0,rcv_addr.gen,&rcv_addr_len))<0){
+	if((rlen=recvfrom(rcv_socket, &rbuffer, 1500,0,rcv_addr.gen,&rcv_addr_len))<0){
 		dbgprintf(0, "Error on receive from ICMPv6 socket (%s)\n",strerror(errno));
 	}
 
@@ -1149,8 +1157,16 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	}
 
 	if(cur==NULL){
-		dbgprintf(1,"Response received but no requests sent with sequence number %i!\n", seq);
-		return -1;
+		if(parms.ip_type==AF_INET && seq==-1){
+			/*IPv4 didn't include enough of the packet to get sequence numbers!*/
+			printf("%s from %s\n",response_label[type],
+								inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000));
+			ping_stats.errors++;
+			return 0;
+		}else{
+			dbgprintf(1,"Response received but no requests sent with sequence number %i!\n", seq);
+			return -1;
+		}
 	}
 
 	diff=(cur->reply.tv_usec + 1000000*cur->reply.tv_sec) - (cur->sent.tv_usec + 1000000*cur->sent.tv_sec);
@@ -1223,6 +1239,7 @@ void sigHandler(){
 	double ploss;
 
 	/*Print Stats*/
+	gettimeofday(&ping_stats.stop,NULL);
 	if(parms.ip_type==AF_INET){
 		printf("-----------%s PING STATISTICS-----------\n",
 				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000));
