@@ -1,9 +1,23 @@
 /******************************************************************************
+Utility to ping hosts using DCCP REQ packets to test for DCCP connectivity.
+
+Copyright (C) 2012  Samuel Jero <sj323707@ohio.edu>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 Author: Samuel Jero <sj323707@ohio.edu>
-
-Date: 10/2012
-
-Description: Program to ping hosts using DCCP REQ packets to test for DCCP connectivity.
+Date: 11/2012
 ******************************************************************************/
 #include <stdarg.h>
 #include <stdlib.h>
@@ -32,8 +46,10 @@ Description: Program to ping hosts using DCCP REQ packets to test for DCCP conne
 
 /*Use the DCCP source port to multiplex DCCP Ping streams by PID*/
 #define SRC_PORT_AS_PID_MULTIPLEX 1
+#define DCCP_SERVICE_CODE 0x50455246
+#define DEFAULT_PORT 33434
 
-
+#define DCCPPING_VERSION 1.0
 #define MAX(x,y) (x>y ? x : y)
 extern int errno;
 
@@ -134,6 +150,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void clearQueue();
 void sigHandler();
 void usage();
+void version();
 void sanitize_environment();
 void dbgprintf(int level, const char *fmt, ...);
 
@@ -155,7 +172,7 @@ int main(int argc, char *argv[])
 	ping_stats.rtt_min=0;
 	ping_stats.errors=0;
 	parms.count=-1;
-	parms.dest_port=33434;
+	parms.dest_port=DEFAULT_PORT;
 	parms.ttl=64;
 	parms. interval=1000;
 	parms.ip_type=AF_UNSPEC;
@@ -164,7 +181,7 @@ int main(int argc, char *argv[])
 
 	sanitize_environment();
 
-	while ((c = getopt(argc, argv, "64c:p:i:dt:S:")) != -1) {
+	while ((c = getopt(argc, argv, "64vhc:p:i:dt:S:")) != -1) {
 		switch (c) {
 			case '6':
 				parms.ip_type=AF_INET6;
@@ -201,6 +218,11 @@ int main(int argc, char *argv[])
 			case 'S':
 				src=optarg;
 				break;
+			case 'v':
+				version();
+				break;
+			case 'h':
+				/*Intentional Fall-through*/
 			default:
 				usage();
 				break;
@@ -856,7 +878,7 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
 	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
 	dhdre->dccph_seq_low=htonl(seq);
-	dhdrr->dccph_req_service= htonl(0x50455246);
+	dhdrr->dccph_req_service=htonl(DCCP_SERVICE_CODE);
 
 	/*Checksums*/
 	if(parms.ip_type==AF_INET){
@@ -1265,7 +1287,21 @@ void sigHandler(){
 /*Usage information for program*/
 void usage()
 {
-	dbgprintf(0, "dccpping: [-d] [-6|-4] [-c count] [-p port] [-i interval] [-t ttl] [-S srcaddress] remote_host\n");
+	dbgprintf(0, "dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]\n");
+	dbgprintf(0, "          [-t ttl] [-S srcaddress] remote_host\n");
+	dbgprintf(0, "\n");
+	dbgprintf(0, "          -d   Debug. May be repeated for aditional verbosity\n");
+	dbgprintf(0, "          -v   Version information\n");
+	dbgprintf(0, "          -h   Help\n");
+	dbgprintf(0, "          -6   Force IPv6 mode\n");
+	dbgprintf(0, "          -4   Force IPv4 mode\n");
+	exit(0);
+}
+
+void version(){
+	dbgprintf(0, "dccpping version %.1f\nCopyright (C) 2012 Samuel Jero <sj323707@ohio.edu>\n", DCCPPING_VERSION);
+	dbgprintf(0, "This program comes with ABSOLUTELY NO WARRANTY.\n");
+	dbgprintf(0, "This is free software, and you are welcome to\nredistribute it under certain conditions.\n");
 	exit(0);
 }
 

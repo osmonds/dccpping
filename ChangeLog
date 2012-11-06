@@ -1,0 +1,8 @@
+11/05/2012
+	v1.0
+	Initial Public Release
+	Features:
+	1)Sends DCCP Request packets to IPv4 or IPv6 hosts to elicit
+	  responses or ICMP messages.
+	2)TTL, destination port, and Source address of the requests are configurable.
+	3)Attempts to autodetect a correct source address if none is specified. 

@@ -1,0 +1,54 @@
+dccpping is a ping-like utility using DCCP Request packets to elict a response
+from another host. It is designed to determine whether a remote host is DCCP
+aware and whether or not a middle box is blocking DCCP packets.
+
+In order to build this program, please simply type "make" at the commandline.
+I have not included a ./configure script with this program because this
+program will only compile on linux anyway (we need the dccp header include file)
+and it comprises only a few files. If you have problems, simply modify the
+makefile as needed. Contact me, if major problems arise.
+
+
+Usage is pretty simple:
+dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]
+          [-t ttl] [-S srcaddress] remote_host
+
+          -d   Debug. May be repeated for aditional verbosity
+          -v   Version information
+          -h   Help
+          -6   Force IPv6 mode
+          -4   Force IPv4 mode
+		  -c   Number of requests to make. The default is unlimited.
+		  -p   The DCCP port to send requests to. The default is 33434.
+		  -i   Interval between requests in seconds. The default is 1 second.
+		  -t   The TTL to set in the sent requests. The default is 64.
+		  -S   Source Address. The address to send packets from. Should
+		  	   only be needed if the autodetection fails.
+		  	   
+		  remote_host can be either an IP address (IPv4 or IPv6) or a hostname.
+		  
+The default behavior is for dccpping to encode its PID into the source port
+of the requests it sends. This behavior can be turned off by setting the
+SRC_PORT_AS_PID_MULTIPLEX #define in dccpping.c to 0.
+
+dccpping is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+dccpping is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with dccpping.  If not, see <http://www.gnu.org/licenses/>.
+
+
+Copyright 2012
+Samuel Jero
+Masters Student
+Computer Science
+Internetworking Research Group
+Ohio University
+sj323707@ohio.edu
