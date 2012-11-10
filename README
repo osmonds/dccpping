@@ -10,7 +10,7 @@ makefile as needed. Contact me, if major problems arise.
 
 
 Usage is pretty simple:
-dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]
+dccpping: [-d] [-v] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]
           [-t ttl] [-S srcaddress] remote_host
 
           -d   Debug. May be repeated for aditional verbosity
@@ -18,6 +18,8 @@ dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]
           -h   Help
           -6   Force IPv6 mode
           -4   Force IPv4 mode
+          -n   Numeric output only. No attempt will be made to lookup symbolic
+               names for host addresses.
 		  -c   Number of requests to make. The default is unlimited.
 		  -p   The DCCP port to send requests to. The default is 33434.
 		  -i   Interval between requests in seconds. The default is 1 second.
@@ -26,10 +28,6 @@ dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]
 		  	   only be needed if the autodetection fails.
 		  	   
 		  remote_host can be either an IP address (IPv4 or IPv6) or a hostname.
-		  
-The default behavior is for dccpping to encode its PID into the source port
-of the requests it sends. This behavior can be turned off by setting the
-SRC_PORT_AS_PID_MULTIPLEX #define in dccpping.c to 0.
 
 dccpping is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

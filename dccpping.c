@@ -1,5 +1,5 @@
 /******************************************************************************
-Utility to ping hosts using DCCP REQ packets to test for DCCP connectivity.
+Utility to ping hosts using DCCP Request packets to test for DCCP connectivity.
 
 Copyright (C) 2012  Samuel Jero <sj323707@ohio.edu>
 
@@ -52,6 +52,9 @@ Date: 11/2012
 #define DCCPPING_VERSION 1.0
 #define MAX(x,y) (x>y ? x : y)
 extern int errno;
+#ifndef NI_IDN
+#define NI_IDN 32
+#endif
 
 
 /*Structure for simpler IPv4/IPv6 Address handling*/
@@ -120,6 +123,7 @@ struct stats{
 
 struct params{
 	int count;				/*Number of pings (-1 is infinity)*/
+	int	no_resolve;			/*1 if we shouldn't resolve IP addresses*/
 	int dest_port;			/*Destination port*/
 	int src_port;			/*Source port---used to encode pid*/
 	int ttl;				/*TTL*/
@@ -128,6 +132,7 @@ struct params{
 	ipaddr_ptr_t dest_addr;	/*Destination Address*/
 	ipaddr_ptr_t src_addr;	/*Source Address*/
 	int dccp_socket;		/*DCCP Socket used to grab src addr/port*/
+	char* hostname;			/*Originally requested hostname*/
 };
 
 
@@ -135,6 +140,9 @@ int 					debug=0;		/*set to 1 to turn on debugging information*/
 struct request_queue 	queue;			/*Queue of requests to track RTT/duplicate information*/
 struct stats			ping_stats;		/*Ping Statistics*/
 struct params			parms;			/*Parameters for ping*/
+char 					addr2str_buf[1000]; 	/*Buffer for printing addresses*/
+char 					addr2nm_buf[1000]; 		/*Buffer for printing addresses*/
+char 					addr2both_buf[1000]; 	/*Buffer for printing addresses*/
 
 
 void getAddresses(char *src, char* dst);
@@ -148,6 +156,7 @@ int logPacket(int req_seq, int packet_seq);
 int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void clearQueue();
 void sigHandler();
+char* addr2str(ipaddr_ptr_t *res, int nores);
 void usage();
 void version();
 void sanitize_environment();
@@ -178,10 +187,12 @@ int main(int argc, char *argv[])
 	parms.dest_addr.gen=NULL;
 	parms.src_addr.gen=NULL;
 	parms.dccp_socket=-1;
+	parms.no_resolve=0;
+	parms.hostname=NULL;
 
 	sanitize_environment();
 
-	while ((c = getopt(argc, argv, "64vhc:p:i:dt:S:")) != -1) {
+	while ((c = getopt(argc, argv, "64vhnc:p:i:dt:S:")) != -1) {
 		switch (c) {
 			case '6':
 				parms.ip_type=AF_INET6;
@@ -208,6 +219,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'd':
 				debug++;
+				break;
+			case 'n':
+				parms.no_resolve=1;
 				break;
 			case 't':
 				parms.ttl = atoi(optarg);
@@ -236,6 +250,7 @@ int main(int argc, char *argv[])
 		usage();
 	}
 	dst=argv[0];
+	parms.hostname=argv[0];
 
 	getAddresses(src, dst);
 	if(parms.src_addr.gen==NULL || parms.dest_addr.gen==NULL){
@@ -257,13 +272,13 @@ void getAddresses(char *src, char* dst){
 	struct addrinfo hint;
 	struct addrinfo *dtmp, *stmp;
 	struct ifaddrs *temp, *cur;
+	ipaddr_ptr_t ipv;
 	struct sockaddr_in6* iv61;
 	struct sockaddr_in6* iv62;
 	struct sockaddr_in* iv41;
 	struct sockaddr_in* iv42;
 	int addrlen;
 	int err;
-	char pbuf[1000];
 
 	/*Lookup destination Address*/
 	memset(&hint,0,sizeof(struct addrinfo));
@@ -286,6 +301,7 @@ void getAddresses(char *src, char* dst){
 			exit(1);
 		}
 		memcpy(parms.dest_addr.gen,dtmp->ai_addr,dtmp->ai_addrlen);
+		parms.dest_addr.gen->sa_family=dtmp->ai_family;
 	}
 	freeaddrinfo(dtmp);
 
@@ -342,15 +358,8 @@ void getAddresses(char *src, char* dst){
 			cur=cur->ifa_next;
 		}
 		if(parms.src_addr.gen==NULL){
-			if(parms.ip_type==AF_INET){
-				iv41=(struct sockaddr_in*)stmp->ai_addr;
-				dbgprintf(0,"Error: Source Address %s does not belong to any interface!\n",
-					inet_ntop(parms.ip_type, (void*)&iv41->sin_addr, pbuf, 1000));
-			}else{
-				iv61=(struct sockaddr_in6*)stmp->ai_addr;
-				dbgprintf(0,"Error: Source Address %s does not belong to any interface!\n",
-					inet_ntop(parms.ip_type, (void*)&iv61->sin6_addr, pbuf, 1000));
-			}
+			ipv.gen=(struct sockaddr*)stmp->ai_addr;
+			dbgprintf(0,"Error: Source Address %s does not belong to any interface!\n",addr2str(&ipv,1));
 			exit(1);
 		}
 		freeifaddrs(temp);
@@ -422,7 +431,6 @@ void doping(){
 	fd_set sel;
 	struct timeval timeout;
 	struct timeval t,delay, add;
-	char pbuf[1000];
 	int request_seq=1;
 	int packet_seq;
 
@@ -459,15 +467,7 @@ void doping(){
 	}
 
 	/*Start Message*/
-	if(parms.ip_type==AF_INET){
-		printf("PINGING %s on DCCP port %i\n",
-				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000),
-				parms.dest_port);
-	}else{
-		printf("PINGING %s on DCCP port %i\n",
-				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000),
-				parms.dest_port);
-	}
+	printf("PINGING %s (%s) on DCCP port %i\n",parms.hostname, addr2str(&parms.dest_addr,1),parms.dest_port);
 
 	while(!done){
 		/*Send Ping*/
@@ -483,10 +483,10 @@ void doping(){
 		}
 		if(parms.ip_type==AF_INET){
 			dbgprintf(1, "Sending DCCP Request to %s\n",
-					inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000));
+					addr2str(&parms.dest_addr,0));
 		}else{
 			dbgprintf(1, "Sending DCCP Request to %s\n",
-					inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000));
+					addr2str(&parms.dest_addr,0));
 		}
 
 		/*Use select to wait on packets or until interval has passed*/
@@ -1028,7 +1028,6 @@ int logPacket(int req_seq, int packet_seq){
 int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	struct request *cur;
 	double diff;
-	char pbuf[1000];
 
 	if(queue.tail==NULL){
 		dbgprintf(1,"Response received but no requests sent!\n");
@@ -1057,8 +1056,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	if(cur==NULL){
 		if(parms.ip_type==AF_INET && seq==-1){
 			/*IPv4 didn't include enough of the packet to get sequence numbers!*/
-			printf("%s from %s\n",response_label[type],
-								inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000));
+			printf("%s from %s\n",response_label[type],addr2str(src,0));
 			ping_stats.errors++;
 			return 0;
 		}else{
@@ -1072,25 +1070,10 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 
 	/*Print Message*/
 	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
-		if(parms.ip_type==AF_INET){
-			printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
-					cur->request_seq, diff,response_label[type]);
-		}else{
-			printf("Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					inet_ntop(parms.ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
-					cur->request_seq, diff,response_label[type]);
-		}
+		printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+					addr2str(src,0),cur->request_seq, diff,response_label[type]);
 	}else{
-		if(parms.ip_type==AF_INET){
-			printf("%s from %s : seq=%i\n",response_label[type],
-					inet_ntop(parms.ip_type, (void*)&src->ipv4->sin_addr, pbuf, 1000),
-					cur->request_seq);
-		}else{
-			printf("%s from %s : seq=%i\n",response_label[type],
-					inet_ntop(parms.ip_type, (void*)&src->ipv6->sin6_addr, pbuf, 1000),
-					cur->request_seq);
-		}
+		printf("%s from %s : seq=%i\n",response_label[type],addr2str(src,0),cur->request_seq);
 	}
 
 	/*Update statistics*/
@@ -1132,19 +1115,13 @@ void clearQueue(){
 }
 
 void sigHandler(){
-	char pbuf[1000];
 	int diff;
 	double ploss;
 
 	/*Print Stats*/
 	gettimeofday(&ping_stats.stop,NULL);
-	if(parms.ip_type==AF_INET){
-		printf("-----------%s PING STATISTICS-----------\n",
-				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv4->sin_addr, pbuf, 1000));
-	}else if(parms.ip_type==AF_INET6){
-		printf("-----------%s PING STATISTICS-----------\n",
-				inet_ntop(parms.ip_type, (void*)&parms.dest_addr.ipv6->sin6_addr, pbuf, 1000));
-	}
+	printf("-----------%s PING STATISTICS-----------\n",parms.hostname);
+
 	diff=(ping_stats.stop.tv_usec + 1000000*ping_stats.stop.tv_sec) -
 			(ping_stats.start.tv_usec + 1000000*ping_stats.start.tv_sec);
 	diff=diff/1000.0;
@@ -1160,15 +1137,46 @@ void sigHandler(){
 	parms.count=0;
 }
 
+char* addr2str(ipaddr_ptr_t *res, int nores){
+	int size;
+	int ret;
+	if (!res->gen->sa_family)
+		return NULL;
+
+	if(res->gen->sa_family==AF_INET){
+		size=sizeof(struct sockaddr_in);
+	}else if(res->gen->sa_family==AF_INET6){
+		size=sizeof(struct sockaddr_in6);
+	}else{
+		return NULL;
+	}
+	if((ret=getnameinfo(res->gen, size,
+			addr2str_buf, sizeof (addr2str_buf), 0, 0, NI_NUMERICHOST))<0){
+		dbgprintf(0,"Error! %s\n",gai_strerror(ret));
+	}
+
+	if (parms.no_resolve||nores){
+		return addr2str_buf;
+	}else{
+	    addr2nm_buf[0] = '\0';
+	    getnameinfo(res->gen, size,
+				addr2nm_buf, sizeof (addr2nm_buf), 0, 0, NI_IDN);
+	    snprintf(addr2both_buf,1000," %s (%s)", addr2nm_buf[0] ? addr2nm_buf : addr2str_buf, addr2str_buf);
+	    return addr2both_buf;
+	}
+	return NULL;
+}
+
 /*Usage information for program*/
 void usage()
 {
-	dbgprintf(0, "dccpping: [-d] [-v] [-h] [-6|-4] [-c count] [-p port] [-i interval]\n");
+	dbgprintf(0, "dccpping: [-d] [-v] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]\n");
 	dbgprintf(0, "          [-t ttl] [-S srcaddress] remote_host\n");
 	dbgprintf(0, "\n");
 	dbgprintf(0, "          -d   Debug. May be repeated for aditional verbosity\n");
 	dbgprintf(0, "          -v   Version information\n");
 	dbgprintf(0, "          -h   Help\n");
+	dbgprintf(0, "          -n   Numeric output only\n");
 	dbgprintf(0, "          -6   Force IPv6 mode\n");
 	dbgprintf(0, "          -4   Force IPv4 mode\n");
 	exit(0);
