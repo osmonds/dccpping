@@ -27,6 +27,7 @@ Date: 11/2012
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -45,7 +46,6 @@ Date: 11/2012
 
 
 /*Use the DCCP source port to multiplex DCCP Ping streams by PID*/
-#define SRC_PORT_AS_PID_MULTIPLEX 1
 #define DCCP_SERVICE_CODE 0x50455246
 #define DEFAULT_PORT 33434
 
@@ -127,6 +127,7 @@ struct params{
 	int ip_type;			/*IPv4 or IPv6*/
 	ipaddr_ptr_t dest_addr;	/*Destination Address*/
 	ipaddr_ptr_t src_addr;	/*Source Address*/
+	int dccp_socket;		/*DCCP Socket used to grab src addr/port*/
 };
 
 
@@ -143,8 +144,6 @@ void handleICMP4packet(int rcv_socket);
 void handleICMP6packet(int rcv_socket);
 void buildRequestPacket(unsigned char* buffer, int *len, int seq);
 void updateRequestPacket(unsigned char* buffer, int *len, int seq);
-void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
-void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket);
 int logPacket(int req_seq, int packet_seq);
 int logResponse(ipaddr_ptr_t *src, int seq, int type);
 void clearQueue();
@@ -178,6 +177,7 @@ int main(int argc, char *argv[])
 	parms.ip_type=AF_UNSPEC;
 	parms.dest_addr.gen=NULL;
 	parms.src_addr.gen=NULL;
+	parms.dccp_socket=-1;
 
 	sanitize_environment();
 
@@ -237,13 +237,6 @@ int main(int argc, char *argv[])
 	}
 	dst=argv[0];
 
-#if SRC_PORT_AS_PID_MULTIPLEX
-	/*Encode PID in source port*/
-	parms.src_port=(getpid()+1024)%65535;
-#else
-	parms.src_port=parms.dest_port;
-#endif
-
 	getAddresses(src, dst);
 	if(parms.src_addr.gen==NULL || parms.dest_addr.gen==NULL){
 		dbgprintf(0,"Error: Can't determine source or destination address\n");
@@ -255,6 +248,7 @@ int main(int argc, char *argv[])
 
 	free(parms.src_addr.gen);
 	free(parms.dest_addr.gen);
+	close(parms.dccp_socket);
 	clearQueue();
 	return 0;
 }
@@ -263,9 +257,13 @@ void getAddresses(char *src, char* dst){
 	struct addrinfo hint;
 	struct addrinfo *dtmp, *stmp;
 	struct ifaddrs *temp, *cur;
-	struct sockaddr_in6* iv6;
+	struct sockaddr_in6* iv61;
+	struct sockaddr_in6* iv62;
+	struct sockaddr_in* iv41;
+	struct sockaddr_in* iv42;
 	int addrlen;
 	int err;
+	char pbuf[1000];
 
 	/*Lookup destination Address*/
 	memset(&hint,0,sizeof(struct addrinfo));
@@ -294,6 +292,8 @@ void getAddresses(char *src, char* dst){
 	/*Get a meaningful source address*/
 	if(src!=NULL){
 		/*Use Commandline arg*/
+
+		/*Convert arg to address*/
 		if((err=getaddrinfo(src,NULL,&hint,&stmp))!=0){
 			dbgprintf(0,"Error: Source Address %s is invalid (%s)\n", src, gai_strerror(err));
 			exit(1);
@@ -301,50 +301,113 @@ void getAddresses(char *src, char* dst){
 		if(stmp==NULL){
 			dbgprintf(0,"Error: Unknown Host %s\n", dst);
 			exit(1);
-		}else{
-			addrlen=stmp->ai_addrlen;
-			parms.src_addr.gen=malloc(stmp->ai_addrlen);
-			if(parms.src_addr.gen==NULL){
-				dbgprintf(0,"Error: Can't allocate Memory\n");
-				exit(1);
-			}
-			memcpy(parms.src_addr.gen,stmp->ai_addr,stmp->ai_addrlen);
 		}
-		freeaddrinfo(stmp);
-	}else{
-		/*Guess a good source address*/
+
+		/*Compare to interface addresses*/
 		getifaddrs(&temp);
 		cur=temp;
 		while(cur!=NULL){
-			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=parms.ip_type){
+			if(cur->ifa_addr==NULL || cur->ifa_addr->sa_family!=stmp->ai_family){
 				/*Not matching ipv4/ipv6 of dest*/
 				cur=cur->ifa_next;
 				continue;
 			}
-			if(cur->ifa_flags & IFF_LOOPBACK){ /*Don't use loopback addresses*/
-				cur=cur->ifa_next;
-				continue;
-			}
-			if(cur->ifa_addr!=NULL && cur->ifa_addr->sa_family==AF_INET6){
-				iv6=(struct sockaddr_in6*)cur->ifa_addr;
-
-				if(iv6->sin6_scope_id!=0){ /*Not globally valid address, if ipv6*/
-					cur=cur->ifa_next;
-					continue;
+			if(stmp->ai_family==AF_INET){
+				iv41=(struct sockaddr_in*)stmp->ai_addr;
+				iv42=(struct sockaddr_in*)cur->ifa_addr;
+				if(memcmp(&iv41->sin_addr,&iv42->sin_addr, sizeof(iv41->sin_addr))==0){
+					parms.src_addr.gen=malloc(sizeof(struct sockaddr_storage));
+					if(parms.src_addr.gen==NULL){
+						dbgprintf(0,"Error: Can't allocate Memory\n");
+						exit(1);
+					}
+					parms.src_addr.gen->sa_family=parms.ip_type;
+					memcpy(parms.src_addr.gen,cur->ifa_addr,addrlen);
+					break;
+				}
+			}else{
+				iv61=(struct sockaddr_in6*)stmp->ai_addr;
+				iv62=(struct sockaddr_in6*)cur->ifa_addr;
+				if(memcmp(&iv61->sin6_addr,&iv62->sin6_addr, sizeof(iv61->sin6_addr))==0){
+					parms.src_addr.gen=malloc(sizeof(struct sockaddr_storage));
+					if(parms.src_addr.gen==NULL){
+						dbgprintf(0,"Error: Can't allocate Memory\n");
+						exit(1);
+					}
+					parms.src_addr.gen->sa_family=parms.ip_type;
+					memcpy(parms.src_addr.gen,cur->ifa_addr,addrlen);
+					break;
 				}
 			}
-
-			parms.src_addr.gen=malloc(sizeof(struct sockaddr_storage));
-			if(parms.src_addr.gen==NULL){
-				dbgprintf(0,"Error: Can't allocate Memory\n");
-				exit(1);
-			}
-			parms.src_addr.gen->sa_family=parms.ip_type;
-			memcpy(parms.src_addr.gen,cur->ifa_addr,addrlen);
-			//break;
 			cur=cur->ifa_next;
 		}
+		if(parms.src_addr.gen==NULL){
+			if(parms.ip_type==AF_INET){
+				iv41=(struct sockaddr_in*)stmp->ai_addr;
+				dbgprintf(0,"Error: Source Address %s does not belong to any interface!\n",
+					inet_ntop(parms.ip_type, (void*)&iv41->sin_addr, pbuf, 1000));
+			}else{
+				iv61=(struct sockaddr_in6*)stmp->ai_addr;
+				dbgprintf(0,"Error: Source Address %s does not belong to any interface!\n",
+					inet_ntop(parms.ip_type, (void*)&iv61->sin6_addr, pbuf, 1000));
+			}
+			exit(1);
+		}
 		freeifaddrs(temp);
+		freeaddrinfo(stmp);
+	}
+
+	/*Create socket to auto respond for open connections and reserve a source port*/
+	parms.dccp_socket=socket(parms.ip_type,SOCK_DCCP, IPPROTO_DCCP);
+	if(parms.dccp_socket<0){
+		dbgprintf(0, "Error: Failed opening DCCP Socket (%s)\n",strerror(errno));
+		exit(1);
+	}
+	fcntl(parms.dccp_socket, F_SETFL, O_NONBLOCK);
+
+
+	if(parms.src_addr.gen==NULL){
+		/*Auto-detect source address*/
+		parms.src_addr.gen=malloc(sizeof(struct sockaddr_storage));
+		if(parms.src_addr.gen==NULL){
+			dbgprintf(0,"Error: Can't allocate Memory\n");
+			exit(1);
+		}
+		memset(parms.src_addr.gen,0,sizeof(struct sockaddr_storage));
+		parms.src_addr.gen->sa_family=parms.ip_type;
+	}else{
+		/*Bind to the given source address*/
+		if(bind(parms.dccp_socket,parms.src_addr.gen,sizeof(struct sockaddr_storage))<0){
+			dbgprintf(0, "Error: Failed bind() on DCCP socket (%s)\n",strerror(errno));
+			exit(1);
+		}
+	}
+
+	/*Connect socket to get source address/port*/
+	if(parms.ip_type==AF_INET){
+		parms.dest_addr.ipv4->sin_port=htons(parms.dest_port);
+	}else{
+		parms.dest_addr.ipv6->sin6_port=htons(parms.dest_port);
+	}
+	if(connect(parms.dccp_socket,parms.dest_addr.gen,sizeof(struct sockaddr_storage))<0){
+		if(errno!=EINPROGRESS){
+			dbgprintf(0, "Error: Failed connect() on DCCP socket (%s)\n",strerror(errno));
+			exit(1);
+		}
+	}
+
+	/*Get source address and port number!*/
+	addrlen=sizeof(struct sockaddr_storage);
+	if(getsockname(parms.dccp_socket,parms.src_addr.gen,(socklen_t*)&addrlen)<0){
+		dbgprintf(0, "Error: Failed getsockname() on DCCP socket (%s)\n",strerror(errno));
+		exit(1);
+	}
+	if(parms.ip_type==AF_INET){
+		parms.src_port=ntohs(parms.src_addr.ipv4->sin_port);
+		parms.dest_addr.ipv4->sin_port=0;
+	}else{
+		parms.src_port=ntohs(parms.src_addr.ipv6->sin6_port);
+		parms.dest_addr.ipv6->sin6_port=0;
 	}
 	return;
 }
@@ -410,7 +473,7 @@ void doping(){
 		/*Send Ping*/
 		if(sendto(rs, &sbuffer, slen, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
 			if(errno!=EINTR){
-				dbgprintf(0,"Error: sendto failed\n");
+				dbgprintf(0,"Error: sendto() failed (%s)\n",strerror(errno));
 			}
 		}
 		if(parms.count==0){done=1; break;}
@@ -485,7 +548,6 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	socklen_t rcv_addr_len;
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_reset *dhdr_re;
-	struct dccp_hdr_ext *dhdre;
 	struct dccp_hdr_response *dhdr_rp;
 	struct dccp_hdr_ack_bits *dhdr_sync;
 	unsigned char* ptr;
@@ -585,13 +647,10 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		}
 
 		/*Log*/
-		dhdre=(struct dccp_hdr_ext*)(ptr+sizeof(struct dccp_hdr));
 		dhdr_rp=(struct dccp_hdr_response*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
 		logResponse(&rcv_addr,ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),RESPONSE);
 
-		/*Send Close*/
-		sendClose(ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),
-				dhdr->dccph_seq, dhdre->dccph_seq_low,send_socket);
+		/*DCCP socket opened in getAddresses() will send Reset*/
 	}
 	if(dhdr->dccph_type==DCCP_PKT_SYNC || dhdr->dccph_type==DCCP_PKT_SYNCACK){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits)){
@@ -600,13 +659,10 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		}
 
 		/*Log*/
-		dhdre=(struct dccp_hdr_ext*)(ptr+sizeof(struct dccp_hdr));
 		dhdr_sync=(struct dccp_hdr_ack_bits*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
 		logResponse(&rcv_addr,ntohl(dhdr_sync->dccph_ack_nr_low),SYNC);
 
-		/*Send Reset*/
-		sendReset(ntohl(dhdr_sync->dccph_ack_nr_low),
-						dhdr->dccph_seq, dhdre->dccph_seq_low,send_socket);
+		/*DCCP socket opened in getAddresses() will send Reset*/
 	}
 
 	free(rcv_addr.gen);
@@ -932,186 +988,6 @@ void updateRequestPacket(unsigned char* buffer, int *len, int seq){
 				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
 	}
 	*len=ip_hdr_len+dccp_hdr_len;
-	return;
-}
-
-void sendClose(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
-	unsigned char buffer[1500];
-	struct dccp_hdr *dhdr;
-	struct dccp_hdr_ext *dhdre;
-	struct dccp_hdr_ack_bits *dhd_ack;
-	struct iphdr* ip4hdr;
-	struct ip6_hdr* ip6hdr;
-	int len;
-	int addrlen;
-
-	int ip_hdr_len;
-	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits);
-
-	memset(buffer, 0, 1500);
-
-	/*IP header*/
-	ip4hdr=NULL;
-	if(parms.ip_type==AF_INET){
-		ip_hdr_len=sizeof(struct iphdr);
-		ip4hdr=(struct iphdr*)buffer;
-		ip4hdr->check=htons(0);
-		memcpy(&ip4hdr->daddr, &parms.dest_addr.ipv4->sin_addr, sizeof(parms.dest_addr.ipv4->sin_addr));
-		ip4hdr->frag_off=htons(0);
-		ip4hdr->id=htons(1);//first
-		ip4hdr->ihl=5;
-		ip4hdr->protocol=IPPROTO_DCCP;
-		memcpy(&ip4hdr->saddr, &parms.src_addr.ipv4->sin_addr, sizeof(parms.src_addr.ipv4->sin_addr));
-		ip4hdr->tos=0;
-		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
-		ip4hdr->ttl=parms.ttl;
-		ip4hdr->version=4;
-	}else{
-		ip_hdr_len=sizeof(struct ip6_hdr);
-		ip6hdr=(struct ip6_hdr*)buffer;
-		memcpy(&ip6hdr->ip6_dst, &parms.dest_addr.ipv6->sin6_addr, sizeof(parms.dest_addr.ipv6->sin6_addr));
-		memcpy(&ip6hdr->ip6_src, &parms.src_addr.ipv6->sin6_addr, sizeof(parms.src_addr.ipv6->sin6_addr));
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=parms.ttl;
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
-	}
-
-	/*DCCP header*/
-	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
-	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
-	dhd_ack=(struct dccp_hdr_ack_bits*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-	dhdr->dccph_ccval=0;
-	dhdr->dccph_checksum=0;
-	dhdr->dccph_cscov=0;
-	dhdr->dccph_doff=dccp_hdr_len/4;
-	dhdr->dccph_dport=htons(parms.dest_port);
-	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(parms.src_port);
-	dhdr->dccph_x=1;
-	dhdr->dccph_type=DCCP_PKT_CLOSE;
-	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
-	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
-	dhdre->dccph_seq_low=htonl(seq+1);
-	dhd_ack->dccph_ack_nr_high=ack_h;
-	dhd_ack->dccph_ack_nr_low=ack_l;
-
-	/*Checksums*/
-	if(parms.ip_type==AF_INET){
-		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
-				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
-		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
-	}else{
-		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
-	}
-	len=ip_hdr_len+dccp_hdr_len;
-
-	/*Send*/
-	if(parms.ip_type==AF_INET){
-		addrlen=sizeof(struct sockaddr_in);
-	}else{
-		addrlen=sizeof(struct sockaddr_in6);
-	}
-	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
-		if(errno!=EINTR){
-			dbgprintf(0,"Error: sendto failed\n");
-		}
-	}
-	return;
-}
-
-void sendReset(int seq, u_int16_t ack_h, u_int32_t ack_l, int socket){
-	unsigned char buffer[1500];
-	struct dccp_hdr *dhdr;
-	struct dccp_hdr_ext *dhdre;
-	struct dccp_hdr_reset *dh_re;
-	struct iphdr* ip4hdr;
-	struct ip6_hdr* ip6hdr;
-	int len;
-	int addrlen;
-
-	int ip_hdr_len;
-	int dccp_hdr_len=sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_reset);
-
-	memset(buffer, 0, 1500);
-
-	/*IP header*/
-	ip4hdr=NULL;
-	if(parms.ip_type==AF_INET){
-		ip_hdr_len=sizeof(struct iphdr);
-		ip4hdr=(struct iphdr*)buffer;
-		ip4hdr->check=htons(0);
-		memcpy(&ip4hdr->daddr, &parms.dest_addr.ipv4->sin_addr, sizeof(parms.dest_addr.ipv4->sin_addr));
-		ip4hdr->frag_off=htons(0);
-		ip4hdr->id=htons(1);//first
-		ip4hdr->ihl=5;
-		ip4hdr->protocol=IPPROTO_DCCP;
-		memcpy(&ip4hdr->saddr, &parms.src_addr.ipv4->sin_addr, sizeof(parms.src_addr.ipv4->sin_addr));
-		ip4hdr->tos=0;
-		ip4hdr->tot_len=htons(ip_hdr_len+dccp_hdr_len);
-		ip4hdr->ttl=parms.ttl;
-		ip4hdr->version=4;
-	}else{
-		ip_hdr_len=sizeof(struct ip6_hdr);
-		ip6hdr=(struct ip6_hdr*)buffer;
-		memcpy(&ip6hdr->ip6_dst, &parms.dest_addr.ipv6->sin6_addr, sizeof(parms.dest_addr.ipv6->sin6_addr));
-		memcpy(&ip6hdr->ip6_src, &parms.src_addr.ipv6->sin6_addr, sizeof(parms.src_addr.ipv6->sin6_addr));
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_flow=htonl(6<<28); //version, traffic class, flow label
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_hlim=parms.ttl;
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt=IPPROTO_DCCP;
-		ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_plen=htons(dccp_hdr_len);
-	}
-
-	/*DCCP header*/
-	dhdr=(struct dccp_hdr*)(buffer+ip_hdr_len);
-	dhdre=(struct dccp_hdr_ext*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr));
-	dh_re=(struct dccp_hdr_reset*)(buffer+ip_hdr_len+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-	dhdr->dccph_ccval=0;
-	dhdr->dccph_checksum=0;
-	dhdr->dccph_cscov=0;
-	dhdr->dccph_doff=dccp_hdr_len/4;
-	dhdr->dccph_dport=htons(parms.dest_port);
-	dhdr->dccph_reserved=0;
-	dhdr->dccph_sport=htons(parms.src_port);
-	dhdr->dccph_x=1;
-	dhdr->dccph_type=DCCP_PKT_RESET;
-	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
-	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
-	dhdre->dccph_seq_low=htonl(seq+1);
-	dh_re->dccph_reset_ack.dccph_ack_nr_high=ack_h;
-	dh_re->dccph_reset_ack.dccph_ack_nr_low=ack_l;
-	dh_re->dccph_reset_code=DCCP_RESET_CODE_CLOSED;
-	dh_re->dccph_reset_data[0]=0;
-	dh_re->dccph_reset_data[1]=0;
-	dh_re->dccph_reset_data[2]=0;
-
-	/*Checksums*/
-	if(parms.ip_type==AF_INET){
-		dhdr->dccph_checksum=ipv4_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &parms.dest_addr.ipv4->sin_addr,
-				(unsigned char*)&parms.src_addr.ipv4->sin_addr, IPPROTO_DCCP);
-		ip4hdr->check=ipv4_chksum(buffer,ip_hdr_len);
-	}else{
-		dhdr->dccph_checksum=ipv6_pseudohdr_chksum((buffer+ip_hdr_len), dccp_hdr_len,
-				(unsigned char*) &parms.dest_addr.ipv6->sin6_addr,
-				(unsigned char*)&parms.src_addr.ipv6->sin6_addr, IPPROTO_DCCP);
-	}
-	len=ip_hdr_len+dccp_hdr_len;
-
-	/*Send*/
-	if(parms.ip_type==AF_INET){
-		addrlen=sizeof(struct sockaddr_in);
-	}else{
-		addrlen=sizeof(struct sockaddr_in6);
-	}
-	if(sendto(socket, &buffer, len, MSG_DONTWAIT,(struct sockaddr*)parms.dest_addr.gen,addrlen)<0){
-		if(errno!=EINTR){
-			dbgprintf(0,"Error: sendto failed\n");
-		}
-	}
 	return;
 }
 
