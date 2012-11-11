@@ -176,10 +176,12 @@ struct request_queue{
 struct stats{
 	int				requests_sent;
 	int				replies_received;
+	int 			duplicates;
 	int				errors;
-	double  		rtt_min;
-	double			rtt_avg;
-	double 			rtt_max;
+	long long  		rtt_min;
+	long long		rtt_sum;
+	long long		rtt_sum2;
+	long 			rtt_max;
 	struct timeval 	start;
 	struct timeval 	stop;
 };
@@ -227,7 +229,7 @@ void usage();
 void version();
 void sanitize_environment();
 void dbgprintf(int level, const char *fmt, ...);
-
+static long llsqrt(long long a);
 
 /*Parse commandline options*/
 int main(int argc, char *argv[])
@@ -242,7 +244,9 @@ int main(int argc, char *argv[])
 	queue.tail=NULL;
 	ping_stats.replies_received=0;
 	ping_stats.requests_sent=0;
-	ping_stats.rtt_avg=0;
+	ping_stats.rtt_sum=0;
+	ping_stats.rtt_sum2=0;
+	ping_stats.duplicates=0;
 	ping_stats.rtt_max=0;
 	ping_stats.rtt_min=0;
 	ping_stats.errors=0;
@@ -1087,7 +1091,7 @@ int logPacket(int req_seq, int packet_seq){
 
 int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	struct request *cur;
-	double diff;
+	long long diff;
 
 	if(queue.tail==NULL){
 		dbgprintf(2,"Response received but no requests sent!\n");
@@ -1099,9 +1103,6 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	while(cur!=NULL){
 		if(cur->packet_seq==seq){
 			gettimeofday(&cur->reply,NULL);
-			if(cur->num_replies>0){
-				printf("Duplicate packet detected! (%i)\n",cur->request_seq);
-			}
 			if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 				cur->num_replies++;
 			}else{
@@ -1126,15 +1127,14 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	}
 
 	diff=(cur->reply.tv_usec + 1000000*cur->reply.tv_sec) - (cur->sent.tv_usec + 1000000*cur->sent.tv_sec);
-	diff=diff/1000.0;
 
 	/*Print Message*/
 	if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 		if(debug==0){
-			printf( "Response from %s : seq=%i  time=%.1fms\n",addr2str(src,0),cur->request_seq, diff);
+			printf( "Response from %s : seq=%i  time=%.1fms\n",addr2str(src,0),cur->request_seq, diff/1000.0);
 		}else{
 			printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					addr2str(src,0),cur->request_seq, diff,response_good[type]);
+					addr2str(src,0),cur->request_seq, diff/1000.0,response_good[type]);
 		}
 	}else{
 
@@ -1145,10 +1145,12 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 		/*Good Response*/
 		if(cur->num_replies==1){
-			ping_stats.rtt_avg=((ping_stats.replies_received*ping_stats.rtt_avg)+(diff))/(ping_stats.replies_received+1);
+			ping_stats.rtt_sum+=diff;
+			ping_stats.rtt_sum2+=(diff*diff);
 			ping_stats.replies_received++;
 		}else{
-			ping_stats.errors++;
+			printf("Duplicate packet detected! (%i)\n",cur->request_seq);
+			ping_stats.duplicates++;
 		}
 		if(diff < ping_stats.rtt_min || ping_stats.rtt_min==0){
 			ping_stats.rtt_min=diff;
@@ -1235,20 +1237,39 @@ void sigHandler(){
 
 void printStats(){
 	int diff;
-	double ploss;
-	/*Print Stats*/
-	gettimeofday(&ping_stats.stop,NULL);
-	printf("-----------%s PING STATISTICS-----------\n",parms.hostname);
+	double ploss, rtt_avg, rtt_avg2, rtt_mdev;
 
+	/*Compute Stats*/
+	if(ping_stats.replies_received>0){
+		rtt_avg=ping_stats.rtt_sum/(ping_stats.replies_received*1.0);
+		rtt_avg2=ping_stats.rtt_sum2/(ping_stats.replies_received*1.0);
+		rtt_mdev=llsqrt(rtt_avg2 - (rtt_avg*rtt_avg));
+	}else{
+		rtt_avg=0;
+		rtt_avg2=0;
+		rtt_mdev=0;
+	}
 	diff=(ping_stats.stop.tv_usec + 1000000*ping_stats.stop.tv_sec) -
 			(ping_stats.start.tv_usec + 1000000*ping_stats.start.tv_sec);
 	diff=diff/1000.0;
+
+	/*Print Stats*/
+	gettimeofday(&ping_stats.stop,NULL);
+	printf("-----------%s PING STATISTICS-----------\n",parms.hostname);
 	ploss=(1.0*(ping_stats.requests_sent-ping_stats.replies_received)/ping_stats.requests_sent*1.0)*100;
-	printf("%i packets transmitted, %i received, %i errors, %.2f%% loss, time %ims\n",
-			ping_stats.requests_sent,ping_stats.replies_received,ping_stats.errors,
-			ploss,diff);
-	printf("rtt min/avg/max = %.1f/%.1f/%.1f ms\n",
-			ping_stats.rtt_min,ping_stats.rtt_avg,ping_stats.rtt_max);
+	printf("%i packets transmitted, %i received, ",ping_stats.requests_sent,ping_stats.replies_received);
+	if(ping_stats.duplicates>0){
+		printf("%i duplicates, ",ping_stats.duplicates);
+	}
+	if(ping_stats.errors>0){
+		printf("%i errors, ",ping_stats.errors);
+	}
+	printf("%.2f%% loss, time %ims\n",ploss,diff);
+	if(ping_stats.replies_received>ping_stats.requests_sent){
+		printf("+Somebody is creating packets out of thing air!\n");
+	}
+	printf("rtt min/avg/max/mdev = %.1f/%.1f/%.1f/%.1f ms\n",
+			ping_stats.rtt_min/1000.0,rtt_avg/1000.0,ping_stats.rtt_max/1000.0,rtt_mdev/1000.0);
 
 }
 
@@ -1324,4 +1345,22 @@ void dbgprintf(int level, const char *fmt, ...)
     	vfprintf(stderr, fmt, args);
     	va_end(args);
     }
+}
+
+/*Square Root function for longs*/
+/*Borrowed from iputils/ping_common.c*/
+/* http://www.skbuff.net/iputils/ */
+static long llsqrt(long long a)
+{
+	long long prev = ~((long long)1 << 63);
+	long long x = a;
+
+	if (x > 0) {
+		while (x < prev) {
+			prev = x;
+			x = (x+(a/x))/2;
+		}
+	}
+
+	return (long)x;
 }
