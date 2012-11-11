@@ -64,31 +64,91 @@ typedef union ipaddr{
 	struct sockaddr_in6 *ipv6;
 } ipaddr_ptr_t;
 
-/*Possible Responses to a Request*/
-enum responses{
+/*Possible Responses*/
+enum response_type{
 	UNKNOWN=0,
-	RESET,
-	RESPONSE,
-	SYNC,
-	DEST_UNREACHABLE,
-	TTL_EXPIRATION,
-	TOO_BIG,
-	PARAMETER_PROBLEM,
-	DCCP_ERROR
+	DCCP_RESET,
+	DCCP_RESPONSE,
+	DCCP_SYNC,
+	ICMPv4,
+	ICMPv6,
 };
 
-/*Output strings corresponding to enum responses*/
-static const char* response_label[]= {
-"Unknown",
-"Closed Port (Reset)",
-"Open Port (Response)",
-"Open Port (Sync)",
-"Destination Unreachable",
-"TTL Expiration",
-"Packet Too Big",
-"DCCP Not Supported (Parameter Problem)",
-"Protocol Error (DCCP Reset)"
+/*Output strings corresponding to Possible Errors*/
+static const char* response_good[] = {
+	"Unknown",
+	"Closed Port (Reset)",
+	"Open Port (Response)",
+	"Open Port (Sync)",
+	"ICMPv4",
+	"ICMPv6"
 };
+
+static const char* response_dccp_reset[] = {
+	"Unspecified",
+	"Closed",
+	"Aborted",
+	"No Connection",
+	"Packet Error",
+	"Option Error",
+	"Mandatory Error",
+	"Connection Refused",
+	"Bad Service Code",
+	"Too Busy",
+	"Bad Init Cookie",
+	"Aggression Penalty"
+};
+
+static const char* response_icmpv4_dest_unreach[] = {
+		"Destination Network Unreachable",
+		"Destination Host Unreachable",
+		"Destination Protocol Unreachable",
+		"Destination Port Unreachable",
+		"Fragmentation Required",
+		"Source Routing Failed",
+		"Destination Network Unknown",
+		"Destination Host Unknown",
+		"Source Host Isolated",
+		"Network Administratively Prohibited",
+		"Host Administratively Prohibited",
+		"Network Unreachable for Type of Service",
+		"Host Unreachable for Type of Service",
+		"Communication Administratively Prohibited",
+		"Host Precedence Violation",
+		"Presedence Cutoff in Effect"
+};
+
+static const char* response_icmpv4_ttl[] = {
+		"TTL Expired",
+		"Fragment Reassembly Failed"
+};
+
+static const char* response_icmpv6_dest_unreach[] = {
+		"No Route to Destination",
+		"Communication Administratively Prohibited",
+		"Beyond Scope of Source Address",
+		"Address Unreachable",
+		"Port Unreachable",
+		"Source Failed Ingress/Eggress Policy",
+		"Rejected Source Route",
+		"Error in Source Routing"
+};
+
+static const char* response_icmpv6_packet_too_big = "Packet Too Big";
+
+static const char* response_icmpv6_ttl[] = {
+		"TTL Expired",
+		"Fragment Reassembly Failed"
+};
+
+static const char* response_icmpv6_param_prob[]={
+		"Erroneous Header Field",
+		"Unrecognized Next Header (DCCP not supported)",
+		"Unrecognized IPv6 Option"
+};
+
+
+
 
 /*Structure to keep track of information about a request*/
 struct request{
@@ -98,7 +158,7 @@ struct request{
 	int				num_errors;
 	struct timeval	sent;
 	struct timeval	reply;
-	enum responses	reply_type;
+	enum response_type	reply_type;
 	struct request  *next;
 	struct request  *prev;
 };
@@ -153,7 +213,8 @@ void handleICMP6packet(int rcv_socket);
 void buildRequestPacket(unsigned char* buffer, int *len, int seq);
 void updateRequestPacket(unsigned char* buffer, int *len, int seq);
 int logPacket(int req_seq, int packet_seq);
-int logResponse(ipaddr_ptr_t *src, int seq, int type);
+int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2);
+const char *get_error_string(int type, int v1, int v2);
 void clearQueue();
 void sigHandler();
 char* addr2str(ipaddr_ptr_t *res, int nores);
@@ -634,9 +695,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 
 		/*Log*/
 		if(dhdr_re->dccph_reset_code==DCCP_RESET_CODE_NO_CONNECTION){
-			logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), RESET);
-		}else{
-			logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), DCCP_ERROR);
+			logResponse(&rcv_addr, ntohl(dhdr_re->dccph_reset_ack.dccph_ack_nr_low), DCCP_RESET,dhdr_re->dccph_reset_code,0);
 		}
 		/*Nothing else to do*/
 	}
@@ -648,7 +707,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 
 		/*Log*/
 		dhdr_rp=(struct dccp_hdr_response*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-		logResponse(&rcv_addr,ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),RESPONSE);
+		logResponse(&rcv_addr,ntohl(dhdr_rp->dccph_resp_ack.dccph_ack_nr_low),DCCP_RESPONSE,0,0);
 
 		/*DCCP socket opened in getAddresses() will send Reset*/
 	}
@@ -660,7 +719,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 
 		/*Log*/
 		dhdr_sync=(struct dccp_hdr_ack_bits*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
-		logResponse(&rcv_addr,ntohl(dhdr_sync->dccph_ack_nr_low),SYNC);
+		logResponse(&rcv_addr,ntohl(dhdr_sync->dccph_ack_nr_low),DCCP_SYNC,0,0);
 
 		/*DCCP socket opened in getAddresses() will send Reset*/
 	}
@@ -678,7 +737,6 @@ void handleICMP4packet(int rcv_socket){
 	struct dccp_hdr_ext *dhdre;
 	struct iphdr* ip4hdr;
 	struct iphdr* iph;
-	int type;
 
 	/*Memory for socket address*/
 	rcv_addr_len=sizeof(struct sockaddr_storage);
@@ -759,16 +817,10 @@ void handleICMP4packet(int rcv_socket){
 	dhdre=(struct dccp_hdr_ext*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr)+ip4hdr->ihl*4+sizeof(struct dccp_hdr));
 
 	/*Log*/
-	if(icmp4->type==ICMP_DEST_UNREACH){
-		type=DEST_UNREACHABLE;
-	}
-	if(icmp4->type==ICMP_TIME_EXCEEDED){
-		type=TTL_EXPIRATION;
-	}
 	if(rlen<sizeof(struct icmphdr)+2*sizeof(struct iphdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
-		logResponse(&rcv_addr,-1,type);
+		logResponse(&rcv_addr,-1,ICMPv4,icmp4->type,icmp4->code);
 	}else{
-		logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+		logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),ICMPv4,icmp4->type,icmp4->code);
 	}
 	free(rcv_addr.gen);
 	return;
@@ -783,7 +835,6 @@ void handleICMP6packet(int rcv_socket){
 	struct ip6_hdr* ip6hdr;
 	struct dccp_hdr *dhdr;
 	struct dccp_hdr_ext *dhdre;
-	int type;
 
 	/*Memory for socket address*/
 	rcv_addr_len=sizeof(struct sockaddr_storage);
@@ -857,19 +908,7 @@ void handleICMP6packet(int rcv_socket){
 	dhdre=(struct dccp_hdr_ext*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr)+sizeof(struct dccp_hdr));
 
 	/*Log*/
-	if(icmp6->icmp6_type==ICMP6_DST_UNREACH){
-		type=DEST_UNREACHABLE;
-	}
-	if(icmp6->icmp6_type==ICMP6_PACKET_TOO_BIG){
-		type=TOO_BIG;
-	}
-	if(icmp6->icmp6_type==ICMP6_TIME_EXCEEDED){
-		type=TTL_EXPIRATION;
-	}
-	if(icmp6->icmp6_type==ICMP6_PARAM_PROB){
-		type=PARAMETER_PROBLEM;
-	}
-	logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low),type);
+	logResponse(&rcv_addr,ntohl(dhdre->dccph_seq_low), ICMPv6, icmp6->icmp6_type,icmp6->icmp6_code);
 	free(rcv_addr.gen);
 	return;
 }
@@ -1025,7 +1064,7 @@ int logPacket(int req_seq, int packet_seq){
 	return 0;
 }
 
-int logResponse(ipaddr_ptr_t *src, int seq, int type){
+int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	struct request *cur;
 	double diff;
 
@@ -1042,7 +1081,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 			if(cur->num_replies>0){
 				printf("Duplicate packet detected! (%i)\n",cur->request_seq);
 			}
-			if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+			if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 				cur->num_replies++;
 			}else{
 				cur->num_errors++;
@@ -1056,7 +1095,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	if(cur==NULL){
 		if(parms.ip_type==AF_INET && seq==-1){
 			/*IPv4 didn't include enough of the packet to get sequence numbers!*/
-			printf("%s from %s\n",response_label[type],addr2str(src,0));
+			printf("%s from %s\n",get_error_string(type,v1,v2),addr2str(src,0));
 			ping_stats.errors++;
 			return 0;
 		}else{
@@ -1069,15 +1108,16 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	diff=diff/1000.0;
 
 	/*Print Message*/
-	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+	if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 		printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
-					addr2str(src,0),cur->request_seq, diff,response_label[type]);
+					addr2str(src,0),cur->request_seq, diff,response_good[type]);
 	}else{
-		printf("%s from %s : seq=%i\n",response_label[type],addr2str(src,0),cur->request_seq);
+
+		printf("%s from %s : seq=%i\n",get_error_string(type,v1,v2),addr2str(src,0),cur->request_seq);
 	}
 
 	/*Update statistics*/
-	if(type<DEST_UNREACHABLE && type!=UNKNOWN){
+	if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
 		/*Good Response*/
 		if(cur->num_replies==1){
 			ping_stats.rtt_avg=((ping_stats.replies_received*ping_stats.rtt_avg)+(diff))/(ping_stats.replies_received+1);
@@ -1097,6 +1137,55 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type){
 	}
 	gettimeofday(&ping_stats.stop,NULL);
 	return 0;
+}
+
+const char *get_error_string(int type, int v1, int v2){
+	const char *label=NULL;
+	switch(type){
+		case DCCP_RESET:
+			if(v1>11){label=NULL;break;}
+			label=response_dccp_reset[v1];
+			break;
+		case ICMPv4:
+			switch(v1){
+				case 3:
+					if(v2>15){label=NULL;break;}
+					label=response_icmpv4_dest_unreach[v2];
+					break;
+				case 11:
+					if(v2>1){label=NULL;break;}
+					label=response_icmpv4_ttl[v2];
+					break;
+				default:
+					label=NULL;
+					break;
+			}
+			break;
+		case ICMPv6:
+			switch(v1){
+				case 1:
+					if(v2>7){label=NULL;break;}
+					label=response_icmpv6_dest_unreach[v2];
+					break;
+				case 2:
+					if(v2>0){label=NULL;break;}
+					label=response_icmpv6_packet_too_big;
+					break;
+				case 3:
+					if(v2>1){label=NULL;break;}
+					label=response_icmpv6_ttl[v2];
+					break;
+				case 4:
+					if(v2>2){label=NULL;break;}
+					label=response_icmpv6_param_prob[v2];
+					break;
+				default:
+					label=NULL;
+					break;
+			}
+			break;
+	}
+	return label;
 }
 
 void clearQueue(){
