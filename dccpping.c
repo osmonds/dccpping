@@ -221,6 +221,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2);
 const char *get_error_string(int type, int v1, int v2);
 void clearQueue();
 void sigHandler();
+void printStats();
 char* addr2str(ipaddr_ptr_t *res, int nores);
 void usage();
 void version();
@@ -613,6 +614,8 @@ void doping(){
 		packet_seq=rand();
 		updateRequestPacket(sbuffer,&slen, packet_seq);
 	}
+
+	printStats();
 
 	close(rs);
 	close(is4);
@@ -1226,9 +1229,13 @@ void clearQueue(){
 }
 
 void sigHandler(){
+	/*Exit Quickly*/
+	parms.count=0;
+}
+
+void printStats(){
 	int diff;
 	double ploss;
-
 	/*Print Stats*/
 	gettimeofday(&ping_stats.stop,NULL);
 	printf("-----------%s PING STATISTICS-----------\n",parms.hostname);
@@ -1243,9 +1250,6 @@ void sigHandler(){
 	printf("rtt min/avg/max = %.1f/%.1f/%.1f ms\n",
 			ping_stats.rtt_min,ping_stats.rtt_avg,ping_stats.rtt_max);
 
-
-	/*Exit Quickly*/
-	parms.count=0;
 }
 
 char* addr2str(ipaddr_ptr_t *res, int nores){
