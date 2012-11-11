@@ -45,15 +45,18 @@ Date: 11/2012
 #include "checksums.h"
 
 
-/*Use the DCCP source port to multiplex DCCP Ping streams by PID*/
-#define DCCP_SERVICE_CODE 0x50455246
+#define DEFAULT_SERVICE_CODE 0x50455246
 #define DEFAULT_PORT 33434
+
 
 #define DCCPPING_VERSION 1.0
 #define MAX(x,y) (x>y ? x : y)
 extern int errno;
 #ifndef NI_IDN
 #define NI_IDN 32
+#endif
+#ifndef SOL_DCCP
+#define SOL_DCCP 269
 #endif
 
 
@@ -193,6 +196,7 @@ struct params{
 	ipaddr_ptr_t src_addr;	/*Source Address*/
 	int dccp_socket;		/*DCCP Socket used to grab src addr/port*/
 	char* hostname;			/*Originally requested hostname*/
+	unsigned int service_code;/*DCCP Service Code*/
 };
 
 
@@ -230,6 +234,7 @@ int main(int argc, char *argv[])
 	char c;
 	char *src=NULL;
 	char *dst=NULL;
+	char *tmp;
 
 	/*Set Defaults*/
 	queue.head=NULL;
@@ -250,10 +255,11 @@ int main(int argc, char *argv[])
 	parms.dccp_socket=-1;
 	parms.no_resolve=0;
 	parms.hostname=NULL;
+	parms.service_code=DEFAULT_SERVICE_CODE;
 
 	sanitize_environment();
 
-	while ((c = getopt(argc, argv, "64vhnc:p:i:dt:S:")) != -1) {
+	while ((c = getopt(argc, argv, "64vVhnc:p:i:t:S:s:")) != -1) {
 		switch (c) {
 			case '6':
 				parms.ip_type=AF_INET6;
@@ -288,6 +294,18 @@ int main(int argc, char *argv[])
 				parms.ttl = atoi(optarg);
 				if (parms.ttl < 1 || parms.ttl > 255) {
 					dbgprintf(0,"Error: Invalid TTL\n");
+					exit(1);
+				}
+				break;
+			case 's':
+				parms.service_code=strtol(optarg,&tmp,0);
+				if(*tmp!='\0'){
+					dbgprintf(0,"Error: Invalid Service Code\n");
+					exit(1);
+				}
+				if(parms.service_code<=0){
+					dbgprintf(0, "Error: Service Code MUST be positive");
+					exit(1);
 				}
 				break;
 			case 'S':
@@ -340,6 +358,7 @@ void getAddresses(char *src, char* dst){
 	struct sockaddr_in* iv42;
 	int addrlen;
 	int err;
+	int opt;
 
 	/*Lookup destination Address*/
 	memset(&hint,0,sizeof(struct addrinfo));
@@ -451,6 +470,11 @@ void getAddresses(char *src, char* dst){
 			dbgprintf(0, "Error: Failed bind() on DCCP socket (%s)\n",strerror(errno));
 			exit(1);
 		}
+	}
+	opt=htonl(parms.service_code);
+	if(setsockopt(parms.dccp_socket,SOL_DCCP, DCCP_SOCKOPT_SERVICE,&opt,sizeof(opt))<0){
+		dbgprintf(0, "Error: Failed setsockopt() on DCCP socket (%s)\n",strerror(errno));
+		exit(1);
 	}
 
 	/*Connect socket to get source address/port*/
@@ -967,7 +991,7 @@ void buildRequestPacket(unsigned char* buffer, int *len, int seq){
 	dhdr->dccph_seq2=htonl(0); //Reserved if using 48 bit sequence numbers
 	dhdr->dccph_seq=htonl(0);  //High 16bits of sequence number. Always make 0 for simplicity.
 	dhdre->dccph_seq_low=htonl(seq);
-	dhdrr->dccph_req_service=htonl(DCCP_SERVICE_CODE);
+	dhdrr->dccph_req_service=htonl(parms.service_code);
 
 	/*Checksums*/
 	if(parms.ip_type==AF_INET){
@@ -1258,7 +1282,7 @@ char* addr2str(ipaddr_ptr_t *res, int nores){
 void usage()
 {
 	dbgprintf(0, "dccpping: [-v] [-V] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]\n");
-	dbgprintf(0, "          [-t ttl] [-S srcaddress] remote_host\n");
+	dbgprintf(0, "          [-t ttl] [-s service_code] [-S srcaddress] remote_host\n");
 	dbgprintf(0, "\n");
 	dbgprintf(0, "          -v   Verbose. May be repeated for aditional verbosity.\n");
 	dbgprintf(0, "          -V   Version information\n");
