@@ -1,3 +1,14 @@
+11/10/2012
+	v1.1
+	Improvements:
+	1)DCCP socket to reserve source port and choose source address. Note that this
+	  requires host machine to support DCCP.
+	2)Reverse DNS lookups (and -n switch to disable)
+	3)Detailed Error Messages
+	4)DCCP Service Code can be specified from commandline (-s switch)
+	5)Much improved statistics
+	
+	
 11/05/2012
 	v1.0
 	Initial Public Release

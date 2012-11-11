@@ -49,7 +49,7 @@ Date: 11/2012
 #define DEFAULT_PORT 33434
 
 
-#define DCCPPING_VERSION 1.0
+#define DCCPPING_VERSION 1.1
 #define MAX(x,y) (x>y ? x : y)
 extern int errno;
 #ifndef NI_IDN
