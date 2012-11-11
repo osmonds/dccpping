@@ -10,11 +10,11 @@ makefile as needed. Contact me, if major problems arise.
 
 
 Usage is pretty simple:
-dccpping: [-d] [-v] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]
+dccpping: [-v] [-V] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]
           [-t ttl] [-S srcaddress] remote_host
 
-          -d   Debug. May be repeated for aditional verbosity
-          -v   Version information
+          -v   Verbose. May be repeated for aditional verbosity.
+          -V   Version information
           -h   Help
           -6   Force IPv6 mode
           -4   Force IPv4 mode

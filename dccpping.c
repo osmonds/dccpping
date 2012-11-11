@@ -278,7 +278,7 @@ int main(int argc, char *argv[])
 					exit(1);
 				}
 				break;
-			case 'd':
+			case 'v':
 				debug++;
 				break;
 			case 'n':
@@ -293,7 +293,7 @@ int main(int argc, char *argv[])
 			case 'S':
 				src=optarg;
 				break;
-			case 'v':
+			case 'V':
 				version();
 				break;
 			case 'h':
@@ -542,13 +542,7 @@ void doping(){
 		if (logPacket(request_seq,packet_seq)<0){
 			dbgprintf(0,"Error: Couldn't record request!\n");
 		}
-		if(parms.ip_type==AF_INET){
-			dbgprintf(1, "Sending DCCP Request to %s\n",
-					addr2str(&parms.dest_addr,0));
-		}else{
-			dbgprintf(1, "Sending DCCP Request to %s\n",
-					addr2str(&parms.dest_addr,0));
-		}
+		dbgprintf(2, "Sending DCCP Request to %s\n", addr2str(&parms.dest_addr,1));
 
 		/*Use select to wait on packets or until interval has passed*/
 		add.tv_sec=parms.interval/1000;
@@ -634,7 +628,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	}
 
 	if(rcv_addr.gen->sa_family!=parms.ip_type){ //confirm IP type
-		dbgprintf(1, "DCCP packet on %s. Tossing.\n", (parms.ip_type==AF_INET) ? "IPv4" : "IPv6");
+		dbgprintf(2, "DCCP packet on %s. Tossing.\n", (parms.ip_type==AF_INET) ? "IPv4" : "IPv6");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -643,13 +637,13 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		/*IPv4*/
 		if(memcmp(&rcv_addr.ipv4->sin_addr,&parms.dest_addr.ipv4->sin_addr,
 				sizeof(parms.dest_addr.ipv4->sin_addr))!=0){ //not from destination
-			dbgprintf(1,"DCCP packet from 3rd host\n");
+			dbgprintf(2,"DCCP packet from 3rd host\n");
 			free(rcv_addr.gen);
 			return;
 		}
 		if(rlen < sizeof(struct dccp_hdr)+sizeof(struct iphdr)){ //check packet size
 
-			dbgprintf(1, "Packet smaller than possible DCCP packet received on DCCP socket\n");
+			dbgprintf(2, "Packet smaller than possible DCCP packet received on DCCP socket\n");
 			free(rcv_addr.gen);
 			return;
 		}
@@ -659,13 +653,13 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 		/*IPv6*/
 		if(memcmp(&rcv_addr.ipv6->sin6_addr, &parms.dest_addr.ipv6->sin6_addr,
 				sizeof(parms.dest_addr.ipv6->sin6_addr))!=0){ //not from destination
-			dbgprintf(1,"DCCP packet from 3rd host\n");
+			dbgprintf(2,"DCCP packet from 3rd host\n");
 			free(rcv_addr.gen);
 			return;
 		}
 		if(rlen < sizeof(struct dccp_hdr)){ //check packet size
 
-			dbgprintf(1, "Packet smaller than possible DCCP packet received on DCCP socket\n");
+			dbgprintf(2, "Packet smaller than possible DCCP packet received on DCCP socket\n");
 			free(rcv_addr.gen);
 			return;
 		}
@@ -675,12 +669,12 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	/*DCCP checks*/
 	dhdr=(struct dccp_hdr*)ptr;
 	if(dhdr->dccph_sport!=htons(parms.dest_port)){
-		dbgprintf(1,"DCCP packet with wrong Source Port (%i)\n", ntohs(dhdr->dccph_sport));
+		dbgprintf(2,"DCCP packet with wrong Source Port (%i)\n", ntohs(dhdr->dccph_sport));
 		free(rcv_addr.gen);
 		return;
 	}
 	if(dhdr->dccph_dport!=htons(parms.src_port)){
-		dbgprintf(1,"DCCP packet with wrong Destination Port\n");
+		dbgprintf(2,"DCCP packet with wrong Destination Port\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -688,7 +682,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	/*Pick Response*/
 	if(dhdr->dccph_type==DCCP_PKT_RESET){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_reset)){
-			dbgprintf(1, "Tossing DCCP Reset packet that's small!\n");
+			dbgprintf(2, "Tossing DCCP Reset packet that's small!\n");
 			return;
 		}
 		dhdr_re=(struct dccp_hdr_reset*)(ptr+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext));
@@ -701,7 +695,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	}
 	if(dhdr->dccph_type==DCCP_PKT_RESPONSE){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_response)){
-			dbgprintf(1, "Tossing DCCP Response packet that's too small!\n");
+			dbgprintf(2, "Tossing DCCP Response packet that's too small!\n");
 			return;
 		}
 
@@ -713,7 +707,7 @@ void handleDCCPpacket(int rcv_socket, int send_socket){
 	}
 	if(dhdr->dccph_type==DCCP_PKT_SYNC || dhdr->dccph_type==DCCP_PKT_SYNCACK){
 		if(rlen < (ptr-rbuffer)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)+sizeof(struct dccp_hdr_ack_bits)){
-			dbgprintf(1, "Tossing DCCP Sync/SyncAck packet that's too small!\n");
+			dbgprintf(2, "Tossing DCCP Sync/SyncAck packet that's too small!\n");
 			return;
 		}
 
@@ -760,21 +754,21 @@ void handleICMP4packet(int rcv_socket){
 
 
 	if(rlen < sizeof(struct icmphdr)+sizeof(struct iphdr)){ //check packet size
-		dbgprintf(1, "Packet smaller than possible ICMPv4 packet!\n");
+		dbgprintf(2, "Packet smaller than possible ICMPv4 packet!\n");
 		free(rcv_addr.gen);
 		return;
 	}
 
 	icmp4=(struct icmphdr*)(rbuffer+iph->ihl*4);
 	if(icmp4->type!=ICMP_DEST_UNREACH && icmp4->type!=ICMP_TIME_EXCEEDED){ //check icmp types
-		dbgprintf(1, "Tossing ICMPv4 packet of type %i\n", icmp4->type);
+		dbgprintf(2, "Tossing ICMPv4 packet of type %i\n", icmp4->type);
 		free(rcv_addr.gen);
 		return;
 	}
 
 	/*Check packet size again*/
 	if(rlen<sizeof(struct icmphdr)+2*sizeof(struct iphdr)+4){
-		dbgprintf(1, "Tossing ICMPv4 packet that's too small to contain DCCP header!\n");
+		dbgprintf(2, "Tossing ICMPv4 packet that's too small to contain DCCP header!\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -783,19 +777,19 @@ void handleICMP4packet(int rcv_socket){
 	ip4hdr=(struct iphdr*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr));
 	if(memcmp(&parms.src_addr.ipv4->sin_addr,&ip4hdr->saddr,sizeof(parms.src_addr.ipv4->sin_addr))!=0){
 		/*Source address doesn't match*/
-		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 source address isn't us\n");
+		dbgprintf(2,"Tossing ICMPv4 packet because the embedded IPv4 source address isn't us\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(memcmp(&parms.dest_addr.ipv4->sin_addr,&ip4hdr->daddr,sizeof(parms.dest_addr.ipv4->sin_addr))!=0){
 		/*Destination address doesn't match*/
-		dbgprintf(1,"Tossing ICMPv4 packet because the embedded IPv4 destination address isn't our target\n");
+		dbgprintf(2,"Tossing ICMPv4 packet because the embedded IPv4 destination address isn't our target\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(ip4hdr->protocol!=IPPROTO_DCCP){
 		/*Not DCCP!*/
-		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet isn't DCCP\n");
+		dbgprintf(2,"Tossing ICMPv4 packet because the embedded packet isn't DCCP\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -804,13 +798,13 @@ void handleICMP4packet(int rcv_socket){
 	dhdr=(struct dccp_hdr*)(rbuffer+iph->ihl*4+sizeof(struct icmphdr)+ip4hdr->ihl*4);
 	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		/*DCCP Destination Ports don't match*/
-		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP destination port\n");
+		dbgprintf(2,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(dhdr->dccph_sport!=htons(parms.src_port)){
 		/*DCCP Source Ports don't match*/
-		dbgprintf(1,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP source port\n");
+		dbgprintf(2,"Tossing ICMPv4 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -850,7 +844,7 @@ void handleICMP6packet(int rcv_socket){
 	}
 
 	if(rlen < sizeof(struct icmp6_hdr)){ //check packet size
-		dbgprintf(1, "Packet smaller than possible ICMPv6 packet!\n");
+		dbgprintf(2, "Packet smaller than possible ICMPv6 packet!\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -858,14 +852,14 @@ void handleICMP6packet(int rcv_socket){
 	icmp6=(struct icmp6_hdr*)rbuffer;
 	if(icmp6->icmp6_type!=ICMP6_DST_UNREACH && icmp6->icmp6_type!=ICMP6_PACKET_TOO_BIG
 			&& icmp6->icmp6_type!=ICMP6_TIME_EXCEEDED && icmp6->icmp6_type!=ICMP6_PARAM_PROB){ //check icmp types
-		dbgprintf(1, "Tossing ICMPv6 packet of type %i\n", icmp6->icmp6_type);
+		dbgprintf(2, "Tossing ICMPv6 packet of type %i\n", icmp6->icmp6_type);
 		free(rcv_addr.gen);
 		return;
 	}
 
 	/*Check packet size again*/
 	if(rlen<sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr)+sizeof(struct dccp_hdr)+sizeof(struct dccp_hdr_ext)){
-		dbgprintf(1, "Tossing ICMPv6 packet that's too small to contain DCCP header!\n");
+		dbgprintf(2, "Tossing ICMPv6 packet that's too small to contain DCCP header!\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -873,20 +867,20 @@ void handleICMP6packet(int rcv_socket){
 	/*Decode IPv6 header*/
 	ip6hdr=(struct ip6_hdr*)(rbuffer+sizeof(struct icmp6_hdr));
 	if(memcmp(&parms.src_addr.ipv6->sin6_addr,&ip6hdr->ip6_src,sizeof(parms.src_addr.ipv6->sin6_addr))!=0){
-		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 source address isn't us\n");
+		dbgprintf(2,"Tossing ICMPv6 packet because the embedded IPv6 source address isn't us\n");
 		/*Source address doesn't match*/
 		free(rcv_addr.gen);
 		return;
 	}
 	if(memcmp(&parms.dest_addr.ipv6->sin6_addr,&ip6hdr->ip6_dst,sizeof(parms.dest_addr.ipv6->sin6_addr))!=0){
 		/*Destination address doesn't match*/
-		dbgprintf(1,"Tossing ICMPv6 packet because the embedded IPv6 destination address isn't our target\n");
+		dbgprintf(2,"Tossing ICMPv6 packet because the embedded IPv6 destination address isn't our target\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(ip6hdr->ip6_ctlun.ip6_un1.ip6_un1_nxt!=IPPROTO_DCCP){
 		/*Not DCCP!*/
-		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet isn't DCCP\n");
+		dbgprintf(2,"Tossing ICMPv6 packet because the embedded packet isn't DCCP\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -895,13 +889,13 @@ void handleICMP6packet(int rcv_socket){
 	dhdr=(struct dccp_hdr*)(rbuffer+sizeof(struct icmp6_hdr)+sizeof(struct ip6_hdr));
 	if(dhdr->dccph_dport!=htons(parms.dest_port)){
 		/*DCCP Destination Ports don't match*/
-		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP destination port\n");
+		dbgprintf(2,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP destination port\n");
 		free(rcv_addr.gen);
 		return;
 	}
 	if(dhdr->dccph_sport!=htons(parms.src_port)){
 		/*DCCP Source Ports don't match*/
-		dbgprintf(1,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP source port\n");
+		dbgprintf(2,"Tossing ICMPv6 packet because the embedded packet doesn't have our DCCP source port\n");
 		free(rcv_addr.gen);
 		return;
 	}
@@ -1069,7 +1063,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 	double diff;
 
 	if(queue.tail==NULL){
-		dbgprintf(1,"Response received but no requests sent!\n");
+		dbgprintf(2,"Response received but no requests sent!\n");
 		return -1;
 	}
 
@@ -1099,7 +1093,7 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 			ping_stats.errors++;
 			return 0;
 		}else{
-			dbgprintf(1,"Response received but no requests sent with sequence number %i!\n", seq);
+			dbgprintf(2,"Response received but no requests sent with sequence number %i!\n", seq);
 			return -1;
 		}
 	}
@@ -1109,8 +1103,12 @@ int logResponse(ipaddr_ptr_t *src, int seq, int type, int v1, int v2){
 
 	/*Print Message*/
 	if((type==DCCP_RESET && v1==3) || type==DCCP_RESPONSE || type==DCCP_SYNC){
-		printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
+		if(debug==0){
+			printf( "Response from %s : seq=%i  time=%.1fms\n",addr2str(src,0),cur->request_seq, diff);
+		}else{
+			printf( "Response from %s : seq=%i  time=%.1fms  status=%s\n",
 					addr2str(src,0),cur->request_seq, diff,response_good[type]);
+		}
 	}else{
 
 		printf("%s from %s : seq=%i\n",get_error_string(type,v1,v2),addr2str(src,0),cur->request_seq);
@@ -1241,7 +1239,7 @@ char* addr2str(ipaddr_ptr_t *res, int nores){
 	}
 	if((ret=getnameinfo(res->gen, size,
 			addr2str_buf, sizeof (addr2str_buf), 0, 0, NI_NUMERICHOST))<0){
-		dbgprintf(0,"Error! %s\n",gai_strerror(ret));
+		dbgprintf(0,"Error: getnameinfo() returned %s\n",gai_strerror(ret));
 	}
 
 	if (parms.no_resolve||nores){
@@ -1259,11 +1257,11 @@ char* addr2str(ipaddr_ptr_t *res, int nores){
 /*Usage information for program*/
 void usage()
 {
-	dbgprintf(0, "dccpping: [-d] [-v] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]\n");
+	dbgprintf(0, "dccpping: [-v] [-V] [-h] [-n] [-6|-4] [-c count] [-p port] [-i interval]\n");
 	dbgprintf(0, "          [-t ttl] [-S srcaddress] remote_host\n");
 	dbgprintf(0, "\n");
-	dbgprintf(0, "          -d   Debug. May be repeated for aditional verbosity\n");
-	dbgprintf(0, "          -v   Version information\n");
+	dbgprintf(0, "          -v   Verbose. May be repeated for aditional verbosity.\n");
+	dbgprintf(0, "          -V   Version information\n");
 	dbgprintf(0, "          -h   Help\n");
 	dbgprintf(0, "          -n   Numeric output only\n");
 	dbgprintf(0, "          -6   Force IPv6 mode\n");
