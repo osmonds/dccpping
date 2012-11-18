@@ -45,7 +45,7 @@ Date: 11/2012
 #include "checksums.h"
 
 
-#define DEFAULT_SERVICE_CODE 0x50455246
+#define DEFAULT_SERVICE_CODE 1885957735
 #define DEFAULT_PORT 33434
 
 
