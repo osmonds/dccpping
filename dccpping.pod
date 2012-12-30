@@ -1,0 +1,72 @@
+=head1 NAME
+
+dccpping - send DCCP Request packets to network hosts
+
+=head1 SYNOPSIS
+
+B<dccpping> [-v] [-V] [-h] [-n] [-6|-4] [-c I<count>] [-p I<port>] [-i I<interval>] [-t I<ttl>] [-s I<service_code>] [-S I<srcaddress>] I<destination>
+
+=head1 DESCRIPTION
+
+B<dccpping> uses DCCP Request packets to elicit a response from a host or gateway.
+	
+For each response received, a line of information about the type of response (DCCP packet
+ or ICMP error) and the round trip time are printed. Upon termination, statistics about
+the loss rate and round trip times are printed.
+
+B<dccpping> uses the well-known "half-open technique", which prevents applications on
+the destination host from seeing our probes at all. Normally, a DCCP Request is sent.
+For non-listened ports we receive a DCCP Reset, and all is done. For active listening
+ports we receive DCCP Response, but answer with a DCCP Reset (instead of the expected
+DCCP Ack), this way the remote DCCP session is closed without the application ever
+noticing.
+
+=head1 OPTIONS
+
+=over 5
+
+=item B<-v>   Verbose. May be repeated for aditional verbosity.
+
+=item B<-V>   Version information
+
+=item B<-h>   Help
+
+=item B<-6>   Force IPv6 mode
+
+=item B<-4>   Force IPv4 mode
+
+=item B<-n>   Numeric output only. No attempt will be made to lookup symbolic names for host addresses.
+
+=item B<-c> I<count>
+
+Stop after sending I<count> requests. The default is unlimited.
+
+=item B<-p> I<port>
+
+Send requests to DCCP port I<port>. The default is 33434.
+
+=item B<-i> I<interval>
+
+Wait I<interval> seconds between sending requests. The default is 1 second.
+
+=item B<-t> I<ttl>
+
+Set the IP Time to Live. The default is 64.
+
+=item B<-s> I<service_code>
+
+Set the DCCP service code to use in requests.
+
+=item B<-S> I<source_address>
+
+Set source address to specified address. Must be a valid address on some interface.
+
+=back
+
+=head1 AUTHOR
+
+Samuel Jero <sj323707@ohio.edu>
+
+=head1 SEE ALSO
+
+B<ping>(8)
